@@ -1,0 +1,11 @@
+pydantic>=2.7
+python-dotenv>=1.0
+pandas>=2.2
+openpyxl>=3.1
+google-genai>=1.0
+pillow>=10.0
+pywin32>=306
+comtypes>=1.2
+pywinauto>=0.6.8
+pyperclip>=1.8
+pyautogui>=0.9.54

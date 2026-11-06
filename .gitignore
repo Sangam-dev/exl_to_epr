@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Secrets (never commit)
+desktop_vision_agent/.env
+.env
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store
+desktop_vision_agent/legacy/
+desktop_vision_agent/plan.md

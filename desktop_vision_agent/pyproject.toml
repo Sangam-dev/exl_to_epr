@@ -1,0 +1,32 @@
+[project]
+name = "excel-desktop-agent"
+version = "0.1.0"
+description = "AI-first Windows desktop agent that enters Excel rows into a target application."
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7",
+    "python-dotenv>=1.0",
+    "pandas>=2.2",
+    "openpyxl>=3.1",
+    "google-genai>=1.0",
+    "pillow>=10.0",
+    "pywin32>=306",
+    "comtypes>=1.2",
+    "pywinauto>=0.6.8",
+    "pyperclip>=1.8",
+    "pyautogui>=0.9.54",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

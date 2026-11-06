@@ -1,0 +1,47 @@
+{
+  "app": {
+    "title_contains": "Invoice Manager",
+    "process_name": null,
+    "require_foreground": true
+  },
+  "excel": {
+    "input_path": "data/input/invoices.xlsx",
+    "output_path": "data/output/invoices_agent.xlsx",
+    "sheet": "Invoices",
+    "header_row": 1,
+    "id_column": "Invoice Number",
+    "status_column": "Agent Status",
+    "timestamp_column": "Agent Timestamp",
+    "error_column": "Agent Error",
+    "done_value": "DONE",
+    "recheck_value": "RECHECK",
+    "skip_statuses": ["DONE"],
+    "empty_cell_policy": "skip"
+  },
+  "fields": [
+    { "column": "Invoice Number", "field": "Invoice Number", "type": "text" },
+    { "column": "Customer Name", "field": "Customer Name", "type": "text" },
+    { "column": "Amount", "field": "Amount", "type": "number" }
+  ],
+  "actions": {
+    "save_button": "Save Record",
+    "new_record_button": null,
+    "wait_after_save_seconds": 1.5
+  },
+  "gemini": {
+    "model": "gemini-3.6-flash",
+    "max_image_dimension": 1600,
+    "timeout_seconds": 60,
+    "max_retries": 3,
+    "max_ai_calls": 50
+  },
+  "safety": {
+    "stop_hotkey": "alt+t",
+    "pause_hotkey": "alt+p",
+    "resume_hotkey": "alt+r",
+    "block_external_input": true,
+    "max_attempts": 3,
+    "action_delay_seconds": 0.15,
+    "stop_on_failure": false
+  }
+}

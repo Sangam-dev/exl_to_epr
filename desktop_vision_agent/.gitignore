@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Generated runtime data (keep the folders, not the contents)
+data/input/*
+data/output/*
+data/screenshots/*
+data/ai_logs/*
+data/state/*
+data/annotated/*
+data/logs/*
+!data/**/.gitkeep
+
+# Logs
+*.log
