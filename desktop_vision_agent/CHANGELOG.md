@@ -3,6 +3,32 @@
 All notable changes to this project are recorded here. One entry per tagged
 segment.
 
+## [v0.5-ai-grounding] - 2026-11-07
+
+### Added
+
+- `ai/client.py`: Gemini client with bounded retries and exponential backoff,
+  JSON extraction from plain/fenced/embedded output, per-call request logs in
+  `data/ai_logs` with credential redaction, and a hard call budget.
+- `ai/prompts.py` + `config/prompts/grounding.md`: versioned, editable grounding
+  prompt with `{{TOKEN}}` placeholders.
+- `ai/grounding.py`: strict Pydantic schema, cross-field validation (one-to-one
+  mapping, known columns/fields/candidates, boxes inside the window), and
+  resolution of every element to a screen rectangle.
+- `desktop/coordinates.py`: normalized `0-1000` -> image/screen conversion and
+  bounds checks.
+- `utils/images.py`: `prepare_image` downscaling and generic `annotate_boxes`.
+- `python main.py ground` with `--no-annotate`; writes
+  `data/grounding/grounding_<stamp>.json` and an annotated screenshot.
+- `gemini.min_layout_confidence` config option.
+- 36 grounding tests (coordinates, JSON extraction, schema, client retries,
+  budget, redaction, prompts).
+
+### Changed
+
+- Agent-owned status columns are excluded from the headers sent to Gemini.
+- `annotate_candidates` now shares the drawing helper with `annotate_boxes`.
+
 ## [v0.4-safety] - 2026-11-07
 
 ### Added

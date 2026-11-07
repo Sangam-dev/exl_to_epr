@@ -16,6 +16,7 @@ data/ai_logs/*
 data/state/*
 data/annotated/*
 data/logs/*
+data/grounding/*
 !data/**/.gitkeep
 
 # Logs

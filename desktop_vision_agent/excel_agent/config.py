@@ -15,7 +15,7 @@ from typing import Literal
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-FieldType = Literal["text", "number"]          #typealias for field types
+FieldType = Literal["text", "number"]          
 EmptyCellPolicy = Literal["skip", "clear"]
 
 
@@ -115,6 +115,7 @@ class GeminiConfig(BaseModel):
     timeout_seconds: int = Field(default=60, ge=5)
     max_retries: int = Field(default=3, ge=0)
     max_ai_calls: int = Field(default=50, ge=0)
+    min_layout_confidence: float = Field(default=0.6, ge=0, le=1)
 
     @field_validator("model")
     @classmethod

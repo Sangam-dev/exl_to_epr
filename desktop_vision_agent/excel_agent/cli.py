@@ -1,15 +1,16 @@
 """Command-line entrypoint and environment diagnostics.
 
 Implemented: ``--check``, ``--version``, ``excel inspect`` (Segment 1),
-``inspect`` (Segment 2), and ``safety test`` (Segment 3). The remaining
-subcommands are registered now so the CLI shape is stable; each one reports
-which segment will implement it.
+``inspect`` (Segment 2), ``safety test`` (Segment 3), and ``ground``
+(Segment 4). The remaining subcommands are registered now so the CLI shape is
+stable; each one reports which segment will implement it.
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import os
 import platform
 import sys
@@ -41,7 +42,6 @@ _FUTURE_COMMANDS = {
     "calibrate": "Segment 6 (first-row calibration)",
     "run": "Segment 7 (batch row runner)",
     "resume": "Segment 8 (stop/resume & state)",
-    "ground": "Segment 4 (Gemini grounding)",
 }
 
 
@@ -162,7 +162,7 @@ def _collect_checks(config_path: str, env_path: str | None) -> list[Check]:
             )
         )
 
-    for name in ("logs", "output", "screenshots", "state"):
+    for name in ("logs", "output", "screenshots", "state", "ai_logs", "grounding"):
         ok, detail = _writable_check(project_root() / "data" / name)
         checks.append(
             Check(
@@ -420,6 +420,162 @@ def run_safety_test(
     return 0
 
 
+def run_ground(
+    config_path: str,
+    annotate: bool = True,
+    env_path: str | None = None,
+) -> int:
+    """Ground the target window: one screenshot + UIA + headers -> field map."""
+    from .ai.client import GeminiClient, GeminiError
+    from .ai.grounding import GroundingError, ground_window
+    from .ai.prompts import PromptError
+    from .desktop.capture import CaptureError, capture_window
+    from .desktop.uia import UIAError, inspect_window
+    from .desktop.window import WindowError, attach_window
+    from .excel.reader import ExcelReadError, read_workbook
+    from .utils.images import annotate_boxes
+
+    load_env(env_path)
+
+    try:
+        config = load_config(config_path)
+        workbook = read_workbook(config)
+        window = attach_window(config.app)
+        capture = capture_window(window)
+    except (ConfigError, ExcelReadError, WindowError, CaptureError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    try:
+        inspection = inspect_window(window)
+    except UIAError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    print(f"Window: 0x{window.handle:X} {window.title!r}")
+    print(f"UIA candidates: {len(inspection.candidates)}")
+
+    reserved = {
+        config.excel.status_column.strip().casefold(),
+        config.excel.timestamp_column.strip().casefold(),
+        config.excel.error_column.strip().casefold(),
+    }
+    headers = [
+        header
+        for header in workbook.headers
+        if header.strip().casefold() not in reserved
+    ]
+    print(f"Excel headers: {len(headers)} (agent status columns excluded)")
+    print(f"Calling Gemini ({config.gemini.model})...")
+
+    try:
+        client = GeminiClient(config.gemini)
+        result = ground_window(
+            client,
+            capture,
+            inspection.candidates,
+            headers,
+            config.gemini,
+        )
+    except (GeminiError, GroundingError, PromptError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = project_root() / "data" / "grounding"
+    json_path = output_dir / f"grounding_{stamp}.json"
+
+    resolved = {
+        element_id: list(element.rect.bbox)
+        for element_id, element in {**result.fields, **result.buttons}.items()
+    }
+    payload = {
+        "window": {
+            "handle": window.handle,
+            "title": window.title,
+            "rect": list(window.rect.bbox),
+        },
+        "image": {
+            "width": result.image_size[0],
+            "height": result.image_size[1],
+        },
+        "model": config.gemini.model,
+        "layout_confidence": result.layout_confidence,
+        "response": result.response.model_dump(),
+        "resolved": resolved,
+        "unmapped_columns": list(result.unmapped_columns),
+        "unmapped_fields": list(result.unmapped_fields),
+        "warnings": list(result.warnings),
+        "ai_log": (
+            str(result.ai.log_path)
+            if result.ai is not None and result.ai.log_path is not None
+            else None
+        ),
+    }
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(f"ERROR: could not save the grounding result: {exc}")
+        return 1
+
+    print()
+    print(f"Layout confidence: {result.layout_confidence:.2f}")
+    print(f"AI calls: {client.calls}")
+    print()
+    print(f"Fields ({len(result.fields)}):")
+    for element in result.fields.values():
+        print(
+            f"  {element.element_id:<4} {_truncate(element.label, 26):<26} "
+            f"{element.type:<7} {element.uia_candidate_id or '-':<5} "
+            f"{element.rect.bbox}"
+        )
+    print(f"Buttons ({len(result.buttons)}):")
+    for element in result.buttons.values():
+        print(
+            f"  {element.element_id:<4} {_truncate(element.label, 26):<26} "
+            f"{element.type:<7} {element.uia_candidate_id or '-':<5} "
+            f"{element.rect.bbox}"
+        )
+    print(f"Column mapping ({len(result.column_mapping)}):")
+    for item in result.column_mapping:
+        field = result.fields.get(item.field_id)
+        label = field.label if field is not None else "?"
+        print(
+            f"  {_truncate(item.column, 24):<24} -> {item.field_id} "
+            f"{_truncate(label, 24):<24} {item.confidence:.2f}"
+        )
+    print(f"Unmapped columns: {', '.join(result.unmapped_columns) or '-'}")
+    print(f"Unmapped fields: {', '.join(result.unmapped_fields) or '-'}")
+    if result.warnings:
+        print(f"Warnings ({len(result.warnings)}):")
+        for warning in result.warnings:
+            print(f"  - {warning}")
+    print(f"Saved: {json_path}")
+
+    if annotate:
+        annotated_path = output_dir / f"grounding_{stamp}_annotated.png"
+        boxes = [
+            (f"{element.element_id} {element.label}".strip(), element.rect, "red")
+            for element in result.fields.values()
+        ]
+        boxes.extend(
+            (f"{element.element_id} {element.label}".strip(), element.rect, "blue")
+            for element in result.buttons.values()
+        )
+        try:
+            annotate_boxes(capture.image, boxes, capture.origin, annotated_path)
+        except OSError as exc:
+            print(f"WARNING: could not save the annotated screenshot: {exc}")
+        else:
+            print(f"Annotated: {annotated_path}")
+
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="excel-agent",
@@ -493,6 +649,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not show the status overlay",
     )
 
+    ground_parser = subparsers.add_parser(
+        "ground", help="ground the target window with Gemini (Segment 4)"
+    )
+    ground_parser.add_argument("--config", default=argparse.SUPPRESS)
+    ground_parser.add_argument("--env-file", default=argparse.SUPPRESS)
+    ground_parser.add_argument(
+        "--no-annotate",
+        action="store_true",
+        help="skip the annotated screenshot",
+    )
+
     for command, segment in _FUTURE_COMMANDS.items():
         sub = subparsers.add_parser(command, help=f"planned for {segment}")
         sub.add_argument("--config", default=argparse.SUPPRESS)
@@ -539,6 +706,13 @@ def main(argv: list[str] | None = None) -> int:
             )
         print("usage: python main.py safety test [--config PATH] [--seconds N]")
         return 2
+
+    if args.command == "ground":
+        return run_ground(
+            args.config,
+            annotate=not args.no_annotate,
+            env_path=args.env_file,
+        )
 
     segment = _FUTURE_COMMANDS.get(args.command, "a later segment")
     print(f"'{args.command}' is not implemented yet; planned for {segment}.")

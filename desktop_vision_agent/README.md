@@ -5,9 +5,9 @@ them into a manually opened target application. Gemini grounds the form layout
 once; deterministic Python fills the fields, verifies the save, and writes
 `DONE` / `RECHECK` back to a copy of the workbook.
 
-> **Status: Segment 3 (input safety).** Window perception, the input layer, the
-> global input lock, and the stop/pause/resume shortcuts are implemented.
-> AI, Excel automation, and the row runner are stubs.
+> **Status: Segment 4 (Gemini grounding).** Window perception, the input layer,
+> the global input lock, stop/pause/resume, and one-shot Gemini grounding are
+> implemented. Mapping approval, calibration, and the row runner are stubs.
 
 ## Requirements
 
@@ -46,7 +46,7 @@ API key.
 | `python main.py excel inspect` | Implemented (Segment 1) |
 | `python main.py inspect` | Implemented (Segment 2) |
 | `python main.py safety test` | Implemented (Segment 3) |
-| `python main.py ground` | Segment 4 |
+| `python main.py ground` | Implemented (Segment 4) |
 | `python main.py setup` | Segment 5 |
 | `python main.py calibrate` | Segment 6 |
 | `python main.py run` | Segment 7 |
@@ -66,6 +66,20 @@ Test the lock without running the agent:
 ```
 
 Input is blocked for 10 seconds, or until `Alt+T` is pressed.
+
+## Grounding
+
+`ground` sends one screenshot, the UIA control list, and the Excel headers to
+Gemini, then validates the returned field map:
+
+```powershell
+..\.venv\Scripts\python.exe main.py ground --config config/agent.test.json
+```
+
+It writes `data/grounding/grounding_<stamp>.json` and an annotated screenshot
+(red = fields, blue = buttons). Every API call is logged to `data/ai_logs`
+with credentials redacted. The model is called once per grounding run, not per
+field or per row.
 
 ## Layout
 
