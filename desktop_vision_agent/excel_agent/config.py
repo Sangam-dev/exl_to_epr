@@ -15,7 +15,7 @@ from typing import Literal
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-FieldType = Literal["text", "number"]
+FieldType = Literal["text", "number"]          #typealias for field types
 EmptyCellPolicy = Literal["skip", "clear"]
 
 

@@ -5,9 +5,9 @@ them into a manually opened target application. Gemini grounds the form layout
 once; deterministic Python fills the fields, verifies the save, and writes
 `DONE` / `RECHECK` back to a copy of the workbook.
 
-> **Status: Segment 1 (Excel read/write).** Workbook reading, status writing,
-> and `excel inspect` are implemented. Desktop, AI, and automation layers are
-> stubs.
+> **Status: Segment 2 (desktop perception).** Window discovery, target-window
+> capture, UIA inspection, and `inspect` are implemented. AI, safety, and
+> automation layers are stubs.
 
 ## Requirements
 
@@ -44,7 +44,7 @@ API key.
 | `python main.py --check` | Implemented (Segment 0) |
 | `python main.py --version` | Implemented (Segment 0) |
 | `python main.py excel inspect` | Implemented (Segment 1) |
-| `python main.py inspect` | Segment 2 |
+| `python main.py inspect` | Implemented (Segment 2) |
 | `python main.py safety test` | Segment 3 |
 | `python main.py ground` | Segment 4 |
 | `python main.py setup` | Segment 5 |

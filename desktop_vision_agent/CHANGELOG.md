@@ -3,6 +3,26 @@
 All notable changes to this project are recorded here. One entry per tagged
 segment.
 
+## [v0.3-desktop] - 2026-11-07
+
+### Added
+
+- `desktop/window.py`: visible-window discovery by title and process name,
+  ambiguity detection, DPI awareness, window/client geometry, and a focus path
+  with the AttachThreadInput fallback.
+- `desktop/capture.py`: target-window capture via `PrintWindow` with
+  `PW_RENDERFULLCONTENT`, plus an `ImageGrab` fallback for minimized captures,
+  blank output, and DPI-virtualized black padding. Includes the image-to-screen
+  transform.
+- `desktop/uia.py`: pywinauto UIA inspection limited to the target window, with
+  native focus/read/invoke helpers.
+- `models/screen.py`: `Rect`, `WindowInfo`, and `UIACandidate`.
+- `utils/images.py`: annotated screenshots for checking UIA alignment.
+- `python main.py inspect` command with `--max-elements` and `--no-annotate`.
+- `scripts/test_form.ps1` WinForms fixture and `config/agent.test.json`.
+- Unit tests for geometry, window matching, capture transforms, DPI padding
+  detection, and annotation.
+
 ## [v0.2-excel] - 2026-11-07
 
 ### Added

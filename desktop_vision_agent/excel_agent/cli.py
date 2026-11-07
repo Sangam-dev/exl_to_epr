@@ -1,8 +1,8 @@
 """Command-line entrypoint and environment diagnostics.
 
-Implemented: ``--check``, ``--version``, and ``excel inspect`` (Segment 1).
-The remaining subcommands are registered now so the CLI shape is stable; each
-one reports which segment will implement it.
+Implemented: ``--check``, ``--version``, ``excel inspect`` (Segment 1), and
+``inspect`` (Segment 2). The remaining subcommands are registered now so the
+CLI shape is stable; each one reports which segment will implement it.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import platform
 import sys
 import warnings
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from . import __version__
@@ -38,7 +39,6 @@ _FUTURE_COMMANDS = {
     "calibrate": "Segment 6 (first-row calibration)",
     "run": "Segment 7 (batch row runner)",
     "resume": "Segment 8 (stop/resume & state)",
-    "inspect": "Segment 2 (window capture, focus, UIA)",
     "ground": "Segment 4 (Gemini grounding)",
     "safety": "Segment 3 (input layer & safety lock)",
 }
@@ -295,6 +295,78 @@ def run_excel_inspect(config_path: str, limit: int = 20) -> int:
     return 0
 
 
+def run_inspect(config_path: str, annotate: bool = True, max_elements: int = 300) -> int:
+    """Capture the target window and list its UIA controls."""
+    from .desktop.capture import CaptureError, capture_window
+    from .desktop.uia import UIAError, inspect_window
+    from .desktop.window import WindowError, attach_window
+    from .utils.images import annotate_candidates
+
+    try:
+        config = load_config(config_path)
+        window = attach_window(config.app)
+        capture = capture_window(window)
+    except (ConfigError, WindowError, CaptureError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    screenshot_dir = project_root() / "data" / "screenshots"
+    screenshot_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = screenshot_dir / f"inspect_{stamp}.png"
+    capture.image.save(raw_path)
+
+    print(f"Window: 0x{window.handle:X} {window.title!r}")
+    print(f"Process: {window.process_name or 'unknown'} | class: {window.class_name}")
+    print(
+        f"Window rect: {window.rect.bbox} "
+        f"({window.rect.width}x{window.rect.height})"
+    )
+    print(
+        f"Client rect: {window.client_rect.bbox} "
+        f"({window.client_rect.width}x{window.client_rect.height})"
+    )
+    print(f"DPI: {window.dpi} ({window.dpi_scale:.2f}x)")
+    print(f"Screenshot: {raw_path} ({capture.image.width}x{capture.image.height})")
+
+    try:
+        inspection = inspect_window(window, max_elements=max_elements)
+    except UIAError as exc:
+        print(f"ERROR: {exc}")
+        print("Screenshot saved for diagnosis.")
+        return 1
+
+    print(f"UIA candidates: {len(inspection.candidates)}")
+    print(
+        f"{'ID':<5} {'Type':<12} {'Name':<30} {'Automation ID':<22} "
+        f"{'Rect':<26} Value"
+    )
+    print("-" * 120)
+    for candidate in inspection.candidates:
+        print(
+            f"{candidate.candidate_id:<5} {candidate.control_type:<12} "
+            f"{_truncate(candidate.name, 30):<30} "
+            f"{_truncate(candidate.automation_id, 22):<22} "
+            f"{str(candidate.rect.bbox):<26} "
+            f"{_truncate(candidate.value, 30)}"
+        )
+    print("-" * 120)
+
+    if annotate:
+        annotated_path = screenshot_dir / f"inspect_{stamp}_annotated.png"
+        annotate_candidates(
+            capture.image,
+            inspection.candidates,
+            capture.origin,
+            annotated_path,
+        )
+        print(f"Annotated: {annotated_path}")
+
+    if not inspection.candidates:
+        print("Warning: no UIA candidates found; the app may be custom-drawn.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="excel-agent",
@@ -331,6 +403,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum rows to display; 0 shows all (default: 20)",
     )
 
+    window_parser = subparsers.add_parser(
+        "inspect", help="capture the target window and list UIA controls (Segment 2)"
+    )
+    window_parser.add_argument("--config", default=argparse.SUPPRESS)
+    window_parser.add_argument(
+        "--max-elements",
+        type=int,
+        default=300,
+        help="maximum UIA controls to list (default: 300)",
+    )
+    window_parser.add_argument(
+        "--no-annotate",
+        action="store_true",
+        help="skip the annotated screenshot",
+    )
+
     for command, segment in _FUTURE_COMMANDS.items():
         sub = subparsers.add_parser(command, help=f"planned for {segment}")
         sub.add_argument("--config", default=argparse.SUPPRESS)
@@ -360,6 +448,13 @@ def main(argv: list[str] | None = None) -> int:
             return run_excel_inspect(args.config, limit=args.limit)
         print("usage: python main.py excel inspect [--config PATH] [--limit N]")
         return 2
+
+    if args.command == "inspect":
+        return run_inspect(
+            args.config,
+            annotate=not args.no_annotate,
+            max_elements=args.max_elements,
+        )
 
     segment = _FUTURE_COMMANDS.get(args.command, "a later segment")
     print(f"'{args.command}' is not implemented yet; planned for {segment}.")
