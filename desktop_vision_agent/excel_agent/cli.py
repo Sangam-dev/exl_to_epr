@@ -1,8 +1,9 @@
 """Command-line entrypoint and environment diagnostics.
 
-Implemented: ``--check``, ``--version``, ``excel inspect`` (Segment 1), and
-``inspect`` (Segment 2). The remaining subcommands are registered now so the
-CLI shape is stable; each one reports which segment will implement it.
+Implemented: ``--check``, ``--version``, ``excel inspect`` (Segment 1),
+``inspect`` (Segment 2), and ``safety test`` (Segment 3). The remaining
+subcommands are registered now so the CLI shape is stable; each one reports
+which segment will implement it.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import importlib
 import os
 import platform
 import sys
+import time
 import warnings
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,7 +42,6 @@ _FUTURE_COMMANDS = {
     "run": "Segment 7 (batch row runner)",
     "resume": "Segment 8 (stop/resume & state)",
     "ground": "Segment 4 (Gemini grounding)",
-    "safety": "Segment 3 (input layer & safety lock)",
 }
 
 
@@ -367,6 +368,58 @@ def run_inspect(config_path: str, annotate: bool = True, max_elements: int = 300
     return 0
 
 
+def run_safety_test(
+    config_path: str,
+    seconds: float = 10.0,
+    overlay: bool = True,
+) -> int:
+    """Block input for a fixed time so the safety shortcuts can be tested."""
+    from .safety.controller import SafetyController
+    from .safety.hotkeys import HotkeyError, hotkeys_from_config
+    from .safety.overlay import NullOverlay, StatusOverlay
+
+    try:
+        config = load_config(config_path)
+        hotkeys = hotkeys_from_config(config.safety)
+    except (ConfigError, HotkeyError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    labels = {hotkey.action: hotkey.label for hotkey in hotkeys}
+    controller = SafetyController(
+        config.safety,
+        overlay=StatusOverlay(labels) if overlay else NullOverlay(),
+    )
+
+    print("Safety test: external mouse and keyboard input will be blocked.")
+    print(
+        f"  {labels['stop']} stop | {labels['pause']} pause | "
+        f"{labels['resume']} resume"
+    )
+    print("  Ctrl+Alt+Del is handled by Windows and is never blocked.")
+    print(f"  Locking for up to {seconds:.0f}s; press {labels['stop']} to release.")
+    print()
+
+    try:
+        controller.start()
+    except Exception as exc:
+        controller.close()
+        print(f"ERROR: {exc}")
+        return 1
+
+    print("Input locked.", flush=True)
+
+    try:
+        controller.wait(seconds)
+    except KeyboardInterrupt:
+        controller.stop(reason="interrupted")
+
+    reason = controller.reason or "timeout"
+    controller.close()
+    print(f"Input released ({reason}).")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="excel-agent",
@@ -419,6 +472,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the annotated screenshot",
     )
 
+    safety_parser = subparsers.add_parser(
+        "safety", help="input lock and hotkey test (Segment 3)"
+    )
+    safety_parser.add_argument("--config", default=argparse.SUPPRESS)
+    safety_sub = safety_parser.add_subparsers(dest="safety_command")
+    safety_test = safety_sub.add_parser(
+        "test", help="block input; the stop hotkey releases it"
+    )
+    safety_test.add_argument("--config", default=argparse.SUPPRESS)
+    safety_test.add_argument(
+        "--seconds",
+        type=float,
+        default=10.0,
+        help="how long to block input (default: 10)",
+    )
+    safety_test.add_argument(
+        "--no-overlay",
+        action="store_true",
+        help="do not show the status overlay",
+    )
+
     for command, segment in _FUTURE_COMMANDS.items():
         sub = subparsers.add_parser(command, help=f"planned for {segment}")
         sub.add_argument("--config", default=argparse.SUPPRESS)
@@ -455,6 +529,16 @@ def main(argv: list[str] | None = None) -> int:
             annotate=not args.no_annotate,
             max_elements=args.max_elements,
         )
+
+    if args.command == "safety":
+        if args.safety_command == "test":
+            return run_safety_test(
+                args.config,
+                seconds=args.seconds,
+                overlay=not args.no_overlay,
+            )
+        print("usage: python main.py safety test [--config PATH] [--seconds N]")
+        return 2
 
     segment = _FUTURE_COMMANDS.get(args.command, "a later segment")
     print(f"'{args.command}' is not implemented yet; planned for {segment}.")

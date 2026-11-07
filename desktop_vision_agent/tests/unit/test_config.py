@@ -94,6 +94,13 @@ def test_app_requires_a_matcher(valid_config: dict) -> None:
         AgentConfig.model_validate(valid_config)
 
 
+def test_hotkeys_must_be_distinct(valid_config: dict) -> None:
+    valid_config["safety"] = {"stop_hotkey": "alt+t", "pause_hotkey": "alt+t"}
+
+    with pytest.raises(ValidationError, match="different hotkeys"):
+        AgentConfig.model_validate(valid_config)
+
+
 def test_resolve_path_uses_project_root() -> None:
     assert resolve_path("data/input/x.xlsx") == project_root() / "data" / "input" / "x.xlsx"
     absolute = project_root() / "data" / "input" / "x.xlsx"

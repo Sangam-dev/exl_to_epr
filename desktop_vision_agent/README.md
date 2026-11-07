@@ -5,9 +5,9 @@ them into a manually opened target application. Gemini grounds the form layout
 once; deterministic Python fills the fields, verifies the save, and writes
 `DONE` / `RECHECK` back to a copy of the workbook.
 
-> **Status: Segment 2 (desktop perception).** Window discovery, target-window
-> capture, UIA inspection, and `inspect` are implemented. AI, safety, and
-> automation layers are stubs.
+> **Status: Segment 3 (input safety).** Window perception, the input layer, the
+> global input lock, and the stop/pause/resume shortcuts are implemented.
+> AI, Excel automation, and the row runner are stubs.
 
 ## Requirements
 
@@ -45,7 +45,7 @@ API key.
 | `python main.py --version` | Implemented (Segment 0) |
 | `python main.py excel inspect` | Implemented (Segment 1) |
 | `python main.py inspect` | Implemented (Segment 2) |
-| `python main.py safety test` | Segment 3 |
+| `python main.py safety test` | Implemented (Segment 3) |
 | `python main.py ground` | Segment 4 |
 | `python main.py setup` | Segment 5 |
 | `python main.py calibrate` | Segment 6 |
@@ -54,10 +54,18 @@ API key.
 
 ## Safety
 
-- `Alt+T` emergency stop, `Alt+P` pause, `Alt+R` resume (implemented in Segment 3).
+- `Alt+T` emergency stop, `Alt+P` pause, `Alt+R` resume.
 - External input is blocked only while the agent is actively running.
 - `Ctrl+Alt+Del` is never blocked.
 - The original workbook is never modified.
+
+Test the lock without running the agent:
+
+```powershell
+..\.venv\Scripts\python.exe main.py safety test --seconds 10
+```
+
+Input is blocked for 10 seconds, or until `Alt+T` is pressed.
 
 ## Layout
 
