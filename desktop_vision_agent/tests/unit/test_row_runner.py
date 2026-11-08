@@ -635,3 +635,52 @@ def test_run_rows_reports_an_aborted_row(monkeypatch) -> None:
     assert result.stopped_row == 2
     assert result.stop_reason == "stopped by the user"
     assert result.processed == 0
+
+
+def test_run_rows_forwards_row_and_layout_callbacks(monkeypatch) -> None:
+    rows_seen: list[RowOutcome] = []
+    layouts_seen: list[object] = []
+    layout = ResolvedLayout(fields={}, save=None)
+
+    def fake_run_row(row, **kwargs):
+        kwargs["on_layout"](layout, _window())
+        return RowOutcome(row.row_number, "DONE", 1)
+
+    monkeypatch.setattr(row_runner, "run_row", fake_run_row)
+
+    run_rows(
+        [_row(2), _row(4)],
+        config=_config(),
+        mapping=_mapping(),
+        writer=FakeWriter(),
+        client=object(),
+        on_row=rows_seen.append,
+        on_layout=lambda item, _window: layouts_seen.append(item),
+    )
+
+    assert [outcome.row_number for outcome in rows_seen] == [2, 4]
+    assert layouts_seen == [layout, layout]
+
+
+def test_run_rows_does_not_report_an_aborted_row(monkeypatch) -> None:
+    rows_seen: list[RowOutcome] = []
+
+    def fake_run_row(row, **_kwargs):
+        if row.row_number == 4:
+            raise RunnerAborted("stopped by the user")
+        return RowOutcome(row.row_number, "DONE", 1)
+
+    monkeypatch.setattr(row_runner, "run_row", fake_run_row)
+
+    result = run_rows(
+        [_row(2), _row(4)],
+        config=_config(),
+        mapping=_mapping(),
+        writer=FakeWriter(),
+        client=object(),
+        on_row=rows_seen.append,
+    )
+
+    assert [outcome.row_number for outcome in rows_seen] == [2]
+    assert result.stopped
+    assert result.stopped_row == 4

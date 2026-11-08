@@ -3,6 +3,20 @@
 All notable changes to this project are recorded here. One entry per tagged
 segment.
 
+## [v0.9-resume] - 2026-11-08
+
+### Added
+
+- `agent/state_store.py`: atomic `run_state.json` — run id, config/mapping/input/copy paths, window info, layout fingerprint, pending row numbers, completed row outcomes, and stopped state; versioned and validated on load.
+- `agent/orchestrator.py`: `RunSession` that persists progress after every row, `start_run` for fresh batches, `resume_run`/`validate_resume` for continuing a stopped run, `resume_rows` to skip every status-bearing row, and `resume_preflight` to re-screenshot, re-inspect UIA, and re-resolve the trusted map before resuming.
+- `agent/row_runner.py` gained `on_row` and `on_layout` callbacks so progress and layout fingerprints are recorded as the run proceeds.
+- `python main.py resume` (and `run --state`): continue a stopped run with no duplicates. `run` refuses to start while a stopped run is recorded; resume re-reads UIA but never calls Gemini unless the save itself is ambiguous.
+- 31 new tests (state store, orchestrator, and runner callbacks).
+
+### Changed
+
+- `run` writes the run-state file at start and after each row; `resume` finishes it at the end.
+
 ## [v0.8-batch] - 2026-11-08
 
 ### Added

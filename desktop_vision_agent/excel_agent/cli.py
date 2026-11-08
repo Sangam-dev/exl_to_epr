@@ -2,9 +2,8 @@
 
 Implemented: ``--check``, ``--version``, ``excel inspect`` (Segment 1),
 ``inspect`` (Segment 2), ``safety test`` (Segment 3), ``ground`` (Segment 4),
-``setup`` (Segment 5), ``calibrate`` (Segment 6), and ``run`` (Segment 7).
-The remaining subcommands are registered now so the CLI shape is stable; each
-one reports which segment will implement it.
+``setup`` (Segment 5), ``calibrate`` (Segment 6), ``run`` (Segment 7), and
+``resume`` (Segment 8).
 """
 
 from __future__ import annotations
@@ -25,8 +24,7 @@ from . import __version__
 from .config import ConfigError, load_config, load_env, project_root
 from .logging_setup import mask_secret, setup_logging
 
-_REQUIRED_MODULES = (
-    ("pydantic", "configuration models"),
+_REQUIRED_MODULES = (    ("pydantic", "configuration models"),
     ("dotenv", "environment loading"),
     ("pandas", "Excel reading"),
     ("openpyxl", "Excel writing"),
@@ -37,10 +35,6 @@ _REQUIRED_MODULES = (
     ("pywinauto", "UIA helper"),
     ("pyperclip", "clipboard paste"),
 )
-
-_FUTURE_COMMANDS = {
-    "resume": "Segment 8 (stop/resume & state)",
-}
 
 
 @dataclass
@@ -873,9 +867,28 @@ def run_batch(
     limit: int | None = None,
     overlay: bool = True,
     env_path: str | None = None,
+    state_path: str | None = None,
+    resume: bool = False,
 ) -> int:
-    """Process pending rows with the trusted coordinate map."""
+    """Process pending rows with the trusted coordinate map.
+
+    A fresh run records its selected rows in the run-state file. ``resume``
+    continues that recorded set after a stop, skipping every row that already
+    carries a status.
+    """
+    from .agent.orchestrator import (
+        OrchestratorError,
+        resume_preflight,
+        resume_rows,
+        resume_run,
+        start_run,
+    )
     from .agent.row_runner import RunnerError, run_rows
+    from .agent.state_store import (
+        DEFAULT_RUN_STATE,
+        StateError,
+        load_run_state,
+    )
     from .agent.workspace import WorkspaceError, open_workspace
     from .ai.client import GeminiClient, GeminiError
     from .ai.mapping import DEFAULT_MAPPING_PATH, MappingError, load_mapping
@@ -899,9 +912,17 @@ def run_batch(
         print(f"ERROR: --limit must be at least 1, got {limit}")
         return 1
 
+    state_file = Path(state_path) if state_path is not None else DEFAULT_RUN_STATE
     mapping_file = (
         Path(mapping_path) if mapping_path is not None else DEFAULT_MAPPING_PATH
     )
+
+    if resume and not state_file.is_file():
+        print(
+            f"ERROR: no run state found at {state_file}. "
+            "Start with `python main.py run`."
+        )
+        return 1
 
     try:
         config = load_config(config_path)
@@ -921,24 +942,67 @@ def run_batch(
     try:
         workspace = open_workspace(config)
         workbook = read_workbook(config, workspace.path)
-        pending = pending_rows(workbook, config)
     except (ExcelReadError, ExcelWriteError, WorkspaceError) as exc:
         print(f"ERROR: {exc}")
         return 1
 
-    issues = validate_pending_rows(pending, config)
-    if issues:
-        print(f"ERROR: {len(issues)} validation issue(s); nothing was processed:")
-        for issue in issues:
-            print(f"  - {issue}")
-        return 1
+    pending: list = []
+    skipped: list = []
+    session = None
 
-    if not pending:
-        print(f"Working copy: {workspace.path}")
-        print("No pending rows; nothing to run.")
+    if resume:
+        try:
+            session = resume_run(
+                state_path=state_file,
+                config_path=config_path,
+                mapping_path=mapping_file,
+                config=config,
+                mapping=mapping,
+                workspace=workspace,
+                rows=workbook.rows,
+            )
+            selected, skipped = resume_rows(session.state, workbook.rows)
+        except (StateError, OrchestratorError) as exc:
+            print(f"ERROR: {exc}")
+            return 1
+
+        issues = validate_pending_rows(selected, config)
+        if issues:
+            print(f"ERROR: {len(issues)} validation issue(s); nothing was processed:")
+            for issue in issues:
+                print(f"  - {issue}")
+            return 1
+    else:
+        pending = pending_rows(workbook, config)
+        issues = validate_pending_rows(pending, config)
+        if issues:
+            print(f"ERROR: {len(issues)} validation issue(s); nothing was processed:")
+            for issue in issues:
+                print(f"  - {issue}")
+            return 1
+        if not pending:
+            print(f"Working copy: {workspace.path}")
+            print("No pending rows; nothing to run.")
+            return 0
+        selected = pending[:limit] if limit is not None else pending
+
+        try:
+            previous = load_run_state(state_file)
+        except StateError as exc:
+            print(f"ERROR: {exc}")
+            return 1
+        if previous is not None and previous.unfinished:
+            print(
+                f"ERROR: a stopped run is recorded at {state_file}. Use "
+                "`python main.py resume` to finish it, or delete that file "
+                "to start a new run."
+            )
+            return 1
+
+    if not selected:
+        print(f"Run state: {state_file}")
+        print("Nothing left to process for this run.")
         return 0
-
-    selected = pending[:limit] if limit is not None else pending
 
     try:
         window = attach_window(config.app)
@@ -963,7 +1027,29 @@ def run_batch(
     )
 
     print(f"Workbook: {workbook.path}")
-    print(f"Pending rows: {len(pending)}; processing: {len(selected)}")
+    if resume:
+        print(f"Run state: {state_file}")
+        print(
+            f"Recorded run: {session.state.run_id or 'unknown'} "
+            f"(stopped at row {session.state.stopped_row}, "
+            f"{len(session.state.completed)} finished)"
+        )
+        print(f"Rows to finish: {len(selected)}")
+        if skipped:
+            print(
+                "  already has a status (not touched): "
+                + ", ".join(str(row.row_number) for row in skipped)
+            )
+        if (
+            session.state.window_title
+            and session.state.window_title != window.title
+        ):
+            print(
+                "  note: the window title changed since the run stopped: "
+                f"{session.state.window_title!r} -> {window.title!r}"
+            )
+    else:
+        print(f"Pending rows: {len(pending)}; processing: {len(selected)}")
     print(
         f"Mapping: {mapping_file} "
         f"(trusted={mapping.trusted}, {len(mapping.entries)} column(s))"
@@ -983,6 +1069,32 @@ def run_batch(
     )
     print()
 
+    if resume:
+        try:
+            preflight = resume_preflight(
+                session,
+                config=config,
+                mapping=mapping,
+                window=window,
+            )
+        except (OrchestratorError, WindowError, CaptureError, UIAError) as exc:
+            writer.close()
+            print(f"ERROR: {exc}")
+            return 1
+        for warning in preflight.warnings:
+            print(f"  note: {warning}")
+        print(
+            f"Preflight: {len(preflight.layout.fields)} field(s) resolved; "
+            "layout "
+            + (
+                "changed since the run stopped"
+                if preflight.changed
+                else "matches the recorded run"
+            )
+        )
+        print(f"Preflight screenshot: {preflight.screenshot}")
+        print()
+
     try:
         controller.start()
     except Exception as exc:
@@ -991,28 +1103,67 @@ def run_batch(
         print(f"ERROR: {exc}")
         return 1
 
+    if not resume:
+        try:
+            session = start_run(
+                config_path=config_path,
+                mapping_path=mapping_file,
+                config=config,
+                mapping=mapping,
+                workspace=workspace,
+                window=window,
+                rows=selected,
+                path=state_file,
+            )
+        except StateError as exc:
+            controller.close()
+            writer.close()
+            print(f"ERROR: {exc}")
+            return 1
+        print(f"Run state: {state_file}")
+        print()
+
     try:
         result = run_rows(
-            pending,
+            selected,
             config=config,
             mapping=mapping,
             writer=writer,
             client=client,
             controller=controller,
-            limit=limit,
+            on_row=session.record,
+            on_layout=session.observe_layout,
         )
     except RunnerError as exc:
+        try:
+            session.abort(str(exc))
+        except StateError as state_exc:
+            print(f"WARNING: could not record the stopped run: {state_exc}")
         print(f"ERROR: {exc}")
+        return 1
+    except StateError as exc:
+        print(f"ERROR: could not record run progress: {exc}")
         return 1
     except KeyboardInterrupt:
         controller.stop(reason="interrupted")
+        try:
+            session.abort("interrupted")
+        except StateError as state_exc:
+            print(f"WARNING: could not record the stopped run: {state_exc}")
         print(
-            "Interrupted; restart the run and DONE rows will be skipped."
+            "Interrupted; resume with `python main.py resume` and finished "
+            "rows will be skipped."
         )
         return 1
     finally:
         controller.close()
         writer.close()
+
+    try:
+        session.finish(result)
+    except StateError as exc:
+        print(f"ERROR: could not record the final run state: {exc}")
+        return 1
 
     print()
     done = result.count(config.excel.done_value)
@@ -1034,12 +1185,36 @@ def run_batch(
             print(f"  screenshot: {path}")
     if result.stopped:
         print(f"Stopped at row {result.stopped_row}: {result.stop_reason}")
+    print(f"Run state: {state_file}")
     print(f"AI calls: {client.calls}")
     print(f"Output workbook: {writer.path}")
 
     if result.stopped:
+        print(
+            "Resume with: python main.py resume "
+            f"--config {config_path}"
+        )
         return 1
     return 0 if recheck == 0 else 1
+
+
+def run_resume(
+    config_path: str,
+    *,
+    mapping_path: str | None = None,
+    state_path: str | None = None,
+    overlay: bool = True,
+    env_path: str | None = None,
+) -> int:
+    """Continue a stopped run from its recorded state."""
+    return run_batch(
+        config_path,
+        mapping_path=mapping_path,
+        overlay=overlay,
+        env_path=env_path,
+        state_path=state_path,
+        resume=True,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1181,16 +1356,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="process at most N pending rows (default: all)",
     )
     run_parser.add_argument(
+        "--state",
+        default=None,
+        help="run state file (default: data/state/run_state.json)",
+    )
+    run_parser.add_argument(
         "--no-overlay",
         action="store_true",
         help="do not show the status overlay",
     )
 
-    for command, segment in _FUTURE_COMMANDS.items():
-        sub = subparsers.add_parser(command, help=f"planned for {segment}")
-        sub.add_argument("--config", default=argparse.SUPPRESS)
-        sub.add_argument("--env-file", default=argparse.SUPPRESS)
-        sub.add_argument("--limit", type=int, default=None, help="row limit (future use)")
+    resume_parser = subparsers.add_parser(
+        "resume", help="continue a stopped run from its saved state (Segment 8)"
+    )
+    resume_parser.add_argument("--config", default=argparse.SUPPRESS)
+    resume_parser.add_argument("--env-file", default=argparse.SUPPRESS)
+    resume_parser.add_argument(
+        "--mapping",
+        default=None,
+        help="approved mapping file (default: data/state/mapping.json)",
+    )
+    resume_parser.add_argument(
+        "--state",
+        default=None,
+        help="run state file (default: data/state/run_state.json)",
+    )
+    resume_parser.add_argument(
+        "--no-overlay",
+        action="store_true",
+        help="do not show the status overlay",
+    )
 
     return parser
 
@@ -1264,10 +1459,19 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.limit,
             overlay=not args.no_overlay,
             env_path=args.env_file,
+            state_path=args.state,
         )
 
-    segment = _FUTURE_COMMANDS.get(args.command, "a later segment")
-    print(f"'{args.command}' is not implemented yet; planned for {segment}.")
+    if args.command == "resume":
+        return run_resume(
+            args.config,
+            mapping_path=args.mapping,
+            state_path=args.state,
+            overlay=not args.no_overlay,
+            env_path=args.env_file,
+        )
+
+    parser.print_help()
     return 2
 
 

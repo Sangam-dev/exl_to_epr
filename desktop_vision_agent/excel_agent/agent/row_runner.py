@@ -451,6 +451,8 @@ def run_rows(
     controller: SafetyController | None = None,
     screenshot_dir: str | Path | None = None,
     limit: int | None = None,
+    on_row: Callable[[RowOutcome], None] | None = None,
+    on_layout: LayoutObserver | None = None,
     output: Callable[[str], None] = print,
 ) -> RunResult:
     """Process pending rows with the trusted map."""
@@ -490,6 +492,8 @@ def run_rows(
                 "from UIA"
             )
             baseline = fingerprint
+        if on_layout is not None:
+            on_layout(layout, window)
 
     outcomes: list[RowOutcome] = []
     stopped = False
@@ -517,6 +521,8 @@ def run_rows(
             break
 
         outcomes.append(outcome)
+        if on_row is not None:
+            on_row(outcome)
         if (
             outcome.status != config.excel.done_value
             and config.safety.stop_on_failure

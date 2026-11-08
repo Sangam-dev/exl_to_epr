@@ -5,10 +5,10 @@ them into a manually opened target application. Gemini grounds the form layout
 once; deterministic Python fills the fields, verifies the save, and writes
 `DONE` / `RECHECK` back to a copy of the workbook.
 
-> **Status: Segment 7 (batch row runner).** Window perception, the input layer,
-> the global input lock, stop/pause/resume, one-shot Gemini grounding, one-time
-> mapping approval, first-row calibration, and batch row processing are
-> implemented. Stop/resume state across process restarts is a stub.
+> **Status: Segment 8 (stop/resume & state).** Run-state persistence
+> (`data/state/run_state.json`), resume from stop with re-screenshot/re-ground,
+> and `python main.py resume` — stop after Save leaves row as RECHECK, resume
+> re-screenshots and re-resolves the trusted map without re-grounding, no row
 
 ## Requirements
 
@@ -51,7 +51,7 @@ API key.
 | `python main.py setup` | Implemented (Segment 5) |
 | `python main.py calibrate` | Implemented (Segment 6) |
 | `python main.py run` | Implemented (Segment 7) |
-| `python main.py resume` | Segment 8 |
+| `python main.py resume` | Implemented (Segment 8) |
 
 ## Safety
 
@@ -155,6 +155,39 @@ The working copy is selected once and recorded in `data/state/output.json`.
 `calibrate` and `run` reuse that same copy, which is how a calibrated row is
 skipped by the batch runner. Delete the file to start a fresh copy from the
 input workbook. `--no-overlay` disables the status overlay.
+
+## Stop and resume
+
+`run` records its progress in `data/state/run_state.json` when it starts and
+after every row:
+
+```powershell
+..\.venv\Scripts\python.exe main.py run --config config/agent.test.json
+```
+
+Press `Alt+T` mid-run. The row currently being filled is left without a
+status; a row that was already saved carries `DONE` in the workbook. When you
+stop:
+
+- the row under way is recorded as unfinished but has no workbook status, so
+  resuming restarts it from scratch instead of saving it twice,
+- every finished row is recorded and never touched again.
+
+Continue later:
+
+```powershell
+..\.venv\Scripts\python.exe main.py resume --config config/agent.test.json
+```
+
+`resume` refuses to start unless the mapping, config, input workbook, and
+working copy all match the recorded run. It re-screenshots, re-inspects UIA,
+and re-resolves the trusted map before touching the next row. If the form
+layout changed structurally, it stops and asks you to run `setup` again; it
+never re-grounds unattended. A stopped run can only be resumed — running `run`
+again reports the recorded stop and tells you to use `resume` instead, or to
+delete `data/state/run_state.json` to start a new run.
+
+`data/state/run_state.json` is gitignored along with the other runtime state.
 
 ## Layout
 
