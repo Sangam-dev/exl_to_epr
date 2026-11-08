@@ -32,6 +32,10 @@ MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP = 0x0010
 
 VK_CONTROL = 0x11
+VK_A = 0x41
+VK_DELETE = 0x2E
+VK_TAB = 0x09
+VK_ESCAPE = 0x1B
 VK_V = 0x56
 
 # A private value that identifies events injected by this agent. Low-level

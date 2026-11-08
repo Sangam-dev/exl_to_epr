@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from PIL import Image
 
@@ -132,14 +132,32 @@ class GeminiClient:
         return self._calls
 
     def generate_json(
-        self, prompt: str, image: Image.Image | None = None
+        self,
+        prompt: str,
+        image: Image.Image | None = None,
+        *,
+        on_attempt: Callable[[int], None] | None = None,
     ) -> AIResponse:
         """Send one prompt (and optional image) and return parsed JSON."""
+        images = [image] if image is not None else []
+        return self.generate_json_images(prompt, images, on_attempt=on_attempt)
+
+    def generate_json_images(
+        self,
+        prompt: str,
+        images: Sequence[Image.Image] = (),
+        *,
+        on_attempt: Callable[[int], None] | None = None,
+    ) -> AIResponse:
+        """Send one prompt with zero or more images and return parsed JSON.
+
+        ``on_attempt`` runs before every request, including retries, so the
+        caller can heartbeat the watchdog between attempts.
+        """
         from google.genai import types
 
-        contents: list[Any] = []
-        if image is not None:
-            contents.append(_image_part(image))
+        image_list = list(images)
+        contents: list[Any] = [_image_part(image) for image in image_list]
         contents.append(prompt)
 
         last_error: Exception | None = None
@@ -148,6 +166,8 @@ class GeminiClient:
                 raise GeminiError(
                     f"AI call budget exhausted ({self._config.max_ai_calls} calls)"
                 )
+            if on_attempt is not None:
+                on_attempt(attempt)
             self._calls += 1
 
             started = time.monotonic()
@@ -168,7 +188,7 @@ class GeminiClient:
                     status="error",
                     attempt=attempt,
                     prompt=prompt,
-                    image=image,
+                    images=image_list,
                     duration=time.monotonic() - started,
                     error=str(exc),
                 )
@@ -191,7 +211,7 @@ class GeminiClient:
                 status="ok",
                 attempt=attempt,
                 prompt=prompt,
-                image=image,
+                images=image_list,
                 duration=time.monotonic() - started,
                 text=text,
                 data=data,
@@ -212,23 +232,24 @@ class GeminiClient:
         status: str,
         attempt: int,
         prompt: str,
-        image: Image.Image | None,
+        images: Sequence[Image.Image],
         duration: float,
         text: str = "",
         data: dict[str, Any] | None = None,
         error: str = "",
     ) -> Path | None:
+        sizes = [
+            {"width": image.width, "height": image.height}
+            for image in images
+        ]
         payload = {
             "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
             "model": self._config.model,
             "attempt": attempt,
             "status": status,
             "duration_ms": int(duration * 1000),
-            "image": (
-                {"width": image.width, "height": image.height}
-                if image is not None
-                else None
-            ),
+            "image": sizes[0] if len(sizes) == 1 else None,
+            "images": sizes,
             "prompt": redact(prompt),
             "response_text": redact(text)[:20000],
             "data": data,

@@ -3,6 +3,34 @@
 All notable changes to this project are recorded here. One entry per tagged
 segment.
 
+## [v0.7-calibration] - 2026-11-08
+
+### Added
+
+- `models/verification.py`: `FieldCheck`, strict pre-save and post-save
+  response schemas, verdicts, and `VerificationError`.
+- `ai/verification.py`: pre-save and post-save prompt builders, strict parsers
+  with cross-field checks, and Gemini wrappers.
+- `config/prompts/pre_save.md` and `config/prompts/post_save.md`.
+- `agent/calibration.py`: live UIA resolution, deterministic fill, UIA
+  read-back, pre-save Gemini check, Save click, post-save pixel-diff veto,
+  post-save Gemini check, safe retry policy, `DONE`/`RECHECK` writing, and
+  trust persistence.
+- `python main.py calibrate` with `--mapping` and `--no-overlay`.
+- `trusted` and `trusted_at` fields in `data/state/mapping.json`;
+  `mark_trusted` persists the calibration result.
+- Gemini client multi-image support (`generate_json_images`) and an
+  `on_attempt` heartbeat for watchdog-safe retries.
+- 40 new tests (verification, calibration helpers, client images/heartbeat,
+  and calibration loop paths).
+
+### Changed
+
+- The calibration row is marked `RECHECK` instead of retrying a save that may
+  already have succeeded; this prevents duplicate records.
+- A stop after Save is recorded as `RECHECK`; a stop before Save leaves the
+  row pending.
+
 ## [v0.6-mapping] - 2026-11-07
 
 ### Added

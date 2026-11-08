@@ -2,9 +2,9 @@
 
 Implemented: ``--check``, ``--version``, ``excel inspect`` (Segment 1),
 ``inspect`` (Segment 2), ``safety test`` (Segment 3), ``ground`` (Segment 4),
-and ``setup`` (Segment 5). The remaining subcommands are registered now so the
-CLI shape is stable; each one reports which segment will implement it.
-opencode -s ses_e4eee252cffedSGHPG9K6DizQ4
+``setup`` (Segment 5), and ``calibrate`` (Segment 6). The remaining
+subcommands are registered now so the CLI shape is stable; each one reports
+which segment will implement it.
 """
 
 from __future__ import annotations
@@ -39,7 +39,6 @@ _REQUIRED_MODULES = (
 )
 
 _FUTURE_COMMANDS = {
-    "calibrate": "Segment 6 (first-row calibration)",
     "run": "Segment 7 (batch row runner)",
     "resume": "Segment 8 (stop/resume & state)",
 }
@@ -721,6 +720,150 @@ def run_setup(
     return 0
 
 
+def run_calibrate(
+    config_path: str,
+    *,
+    mapping_path: str | None = None,
+    overlay: bool = True,
+    env_path: str | None = None,
+) -> int:
+    """Fill and verify the first pending row, then trust the map on success."""
+    from .agent.calibration import (
+        CalibrationAborted,
+        CalibrationError,
+        calibrate_row,
+    )
+    from .ai.client import GeminiClient, GeminiError
+    from .ai.mapping import DEFAULT_MAPPING_PATH, MappingError, load_mapping
+    from .desktop.capture import CaptureError
+    from .desktop.uia import UIAError
+    from .desktop.window import WindowError, attach_window
+    from .excel.reader import (
+        ExcelReadError,
+        pending_rows,
+        read_workbook,
+        validate_pending_rows,
+    )
+    from .excel.writer import ExcelWriteError, WorkbookWriter
+    from .safety.controller import SafetyController
+    from .safety.hotkeys import HotkeyError, hotkeys_from_config
+    from .safety.overlay import NullOverlay, StatusOverlay
+
+    load_env(env_path)
+
+    mapping_file = (
+        Path(mapping_path) if mapping_path is not None else DEFAULT_MAPPING_PATH
+    )
+
+    try:
+        config = load_config(config_path)
+        workbook = read_workbook(config)
+        mapping = load_mapping(mapping_file)
+        pending = pending_rows(workbook, config)
+    except (
+        ConfigError,
+        ExcelReadError,
+        MappingError,
+    ) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    issues = validate_pending_rows(pending, config)
+    if issues:
+        print(f"ERROR: {len(issues)} validation issue(s); nothing was processed:")
+        for issue in issues:
+            print(f"  - {issue}")
+        return 1
+
+    if not pending:
+        print("No pending rows; nothing to calibrate.")
+        return 0
+
+    row = pending[0]
+    print(f"Workbook: {workbook.path}")
+    print(f"Pending rows: {len(pending)}; calibration row: {row.row_number}")
+    print(
+        f"Mapping: {mapping_file} "
+        f"(trusted={mapping.trusted}, {len(mapping.entries)} column(s))"
+    )
+
+    try:
+        window = attach_window(config.app)
+        writer = WorkbookWriter.from_config(config)
+        client = GeminiClient(config.gemini)
+        hotkeys = hotkeys_from_config(config.safety)
+    except (
+        WindowError,
+        CaptureError,
+        UIAError,
+        ExcelWriteError,
+        GeminiError,
+        HotkeyError,
+    ) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    labels = {hotkey.action: hotkey.label for hotkey in hotkeys}
+    controller = SafetyController(
+        config.safety,
+        overlay=StatusOverlay(labels) if overlay else NullOverlay(),
+    )
+
+    print(f"Window: 0x{window.handle:X} {window.title!r}")
+    print(f"Output copy: {writer.path}")
+    print(f"Gemini: {config.gemini.model}")
+    print(
+        f"  {labels['stop']} stop | {labels['pause']} pause | "
+        f"{labels['resume']} resume"
+    )
+    print()
+
+    try:
+        controller.start()
+    except Exception as exc:
+        controller.close()
+        writer.close()
+        print(f"ERROR: {exc}")
+        return 1
+
+    try:
+        result = calibrate_row(
+            row,
+            config=config,
+            mapping=mapping,
+            writer=writer,
+            client=client,
+            mapping_path=mapping_file,
+            controller=controller,
+        )
+    except CalibrationAborted as exc:
+        print(f"Stopped: {exc}")
+        print(f"Row {row.row_number} was left pending.")
+        return 1
+    except CalibrationError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        controller.stop(reason="interrupted")
+        print(f"Interrupted; row {row.row_number} was left pending.")
+        return 1
+    finally:
+        controller.close()
+        writer.close()
+
+    print()
+    print(f"Row {result.row_number}: {result.status}")
+    print(f"Attempts: {result.attempts}")
+    print(f"Map trusted: {result.trusted}")
+    if result.error:
+        print(f"Error: {result.error}")
+    for path in result.screenshots:
+        print(f"Screenshot: {path}")
+    print(f"AI calls: {client.calls}")
+    print(f"Output workbook: {writer.path}")
+    return 0 if result.status == config.excel.done_value else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="excel-agent",
@@ -826,6 +969,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the annotated screenshot",
     )
 
+    calibrate_parser = subparsers.add_parser(
+        "calibrate",
+        help="fill and verify the first pending row (Segment 6)",
+    )
+    calibrate_parser.add_argument("--config", default=argparse.SUPPRESS)
+    calibrate_parser.add_argument("--env-file", default=argparse.SUPPRESS)
+    calibrate_parser.add_argument(
+        "--mapping",
+        default=None,
+        help="approved mapping file (default: data/state/mapping.json)",
+    )
+    calibrate_parser.add_argument(
+        "--no-overlay",
+        action="store_true",
+        help="do not show the status overlay",
+    )
+
     for command, segment in _FUTURE_COMMANDS.items():
         sub = subparsers.add_parser(command, help=f"planned for {segment}")
         sub.add_argument("--config", default=argparse.SUPPRESS)
@@ -886,6 +1046,14 @@ def main(argv: list[str] | None = None) -> int:
             assume_yes=args.yes,
             mapping_path=args.mapping,
             annotate=not args.no_annotate,
+            env_path=args.env_file,
+        )
+
+    if args.command == "calibrate":
+        return run_calibrate(
+            args.config,
+            mapping_path=args.mapping,
+            overlay=not args.no_overlay,
             env_path=args.env_file,
         )
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Literal, Sequence
 
@@ -78,6 +79,8 @@ class ApprovedMapping(BaseModel):
     entries: list[MappingEntry] = Field(default_factory=list)
     buttons: list[ButtonEntry] = Field(default_factory=list)
     unmapped_columns: list[str] = Field(default_factory=list)
+    trusted: bool = False
+    trusted_at: str = ""
 
     def field_for_column(self, column: str) -> MappingEntry | None:
         for entry in self.entries:
@@ -271,6 +274,28 @@ def save_mapping(
     except OSError as exc:
         raise MappingError(f"cannot write mapping {target}: {exc}") from exc
     return target
+
+
+def mark_trusted(
+    mapping: ApprovedMapping,
+    path: str | Path | None = None,
+    *,
+    trusted: bool = True,
+    when: datetime | None = None,
+) -> ApprovedMapping:
+    """Persist the calibration trust flag and return the updated mapping."""
+    stamp = ""
+    if trusted:
+        stamp = (
+            (when or datetime.now())
+            .astimezone()
+            .isoformat(timespec="seconds")
+        )
+    updated = mapping.model_copy(
+        update={"trusted": trusted, "trusted_at": stamp}
+    )
+    save_mapping(updated, path)
+    return updated
 
 
 def load_mapping(path: str | Path | None = None) -> ApprovedMapping:

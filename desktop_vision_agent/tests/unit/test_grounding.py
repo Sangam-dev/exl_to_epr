@@ -480,6 +480,66 @@ def test_client_logs_requests_and_redacts_secrets(tmp_path: Path) -> None:
     assert "<REDACTED>" in logged
 
 
+class CapturingModels:
+    def __init__(self, results: list) -> None:
+        self.results = list(results)
+        self.contents: list[list] = []
+
+    def generate_content(self, **kwargs):
+        self.contents.append(kwargs["contents"])
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return FakeResponse(result)
+
+
+class CapturingClient:
+    def __init__(self, results: list) -> None:
+        self.models = CapturingModels(results)
+
+
+def test_client_sends_multiple_images_in_order(tmp_path: Path) -> None:
+    fake = CapturingClient(['{"ok": true}'])
+    client = GeminiClient(
+        GeminiConfig(),
+        api_key="test",
+        client=fake,
+        log_dir=tmp_path,
+    )
+
+    response = client.generate_json_images(
+        "compare these",
+        [
+            Image.new("RGB", (40, 30), "white"),
+            Image.new("RGB", (50, 20), "black"),
+        ],
+    )
+
+    assert response.data == {"ok": True}
+    contents = fake.models.contents[0]
+    assert len(contents) == 3
+    assert contents[-1] == "compare these"
+    logged = response.log_path.read_text(encoding="utf-8")
+    assert '"width": 40' in logged
+    assert '"width": 50' in logged
+
+
+def test_client_beats_before_every_attempt(tmp_path: Path) -> None:
+    fake = FakeClient([RuntimeError("boom"), '{"ok": true}'])
+    attempts: list[int] = []
+    client = GeminiClient(
+        GeminiConfig(max_retries=1),
+        api_key="test",
+        client=fake,
+        log_dir=tmp_path,
+        sleep=lambda _: None,
+    )
+
+    client.generate_json("hello", on_attempt=attempts.append)
+
+    assert attempts == [1, 2]
+
+
 class StubGroundingClient:
     def __init__(self, data: dict) -> None:
         self.data = data

@@ -5,10 +5,10 @@ them into a manually opened target application. Gemini grounds the form layout
 once; deterministic Python fills the fields, verifies the save, and writes
 `DONE` / `RECHECK` back to a copy of the workbook.
 
-> **Status: Segment 5 (mapping & approval).** Window perception, the input
+> **Status: Segment 6 (first-row calibration).** Window perception, the input
 > layer, the global input lock, stop/pause/resume, one-shot Gemini grounding,
-> and one-time mapping approval are implemented. Calibration and the row runner
-> are stubs.
+> one-time mapping approval, and first-row calibration are implemented. The
+> batch row runner and stop/resume state are stubs.
 
 ## Requirements
 
@@ -49,7 +49,7 @@ API key.
 | `python main.py safety test` | Implemented (Segment 3) |
 | `python main.py ground` | Implemented (Segment 4) |
 | `python main.py setup` | Implemented (Segment 5) |
-| `python main.py calibrate` | Segment 6 |
+| `python main.py calibrate` | Implemented (Segment 6) |
 | `python main.py run` | Segment 7 |
 | `python main.py resume` | Segment 8 |
 
@@ -108,6 +108,26 @@ required columns). Low-confidence entries are warnings and need an explicit
 
 The approved mapping is saved to `data/state/mapping.json` (override with
 `--mapping`). Later segments reuse that file instead of asking Gemini again.
+
+## First-row calibration
+
+`calibrate` processes the first pending row and proves the mapping before
+trusting it:
+
+```powershell
+..\.venv\Scripts\python.exe main.py calibrate --config config/agent.test.json
+```
+
+It re-inspects the live window, fills the mapped fields, reads them back
+through UIA, takes a pre-save screenshot, and asks Gemini to confirm the
+values. Only then does it click Save. A post-save screenshot is compared with
+the pre-save image and sent to Gemini; the row is marked `DONE` only when both
+checks pass. Every attempt saves its screenshots to `data/screenshots/`.
+
+The mapping stays `trusted: false` until both checks pass. On failure the row
+is marked `RECHECK` and the map stays untrusted. A save that may already have
+succeeded is never retried automatically, so a failed calibration cannot
+create duplicate records. `--no-overlay` disables the status overlay.
 
 ## Layout
 
