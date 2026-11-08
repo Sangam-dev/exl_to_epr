@@ -67,6 +67,7 @@ class ExcelConfig(BaseModel):
     recheck_value: str = "RECHECK"
     skip_statuses: list[str] = Field(default_factory=lambda: ["DONE"])
     empty_cell_policy: EmptyCellPolicy = "skip"
+    required_columns: list[str] = Field(default_factory=list)
 
     @field_validator("id_column", "status_column", "timestamp_column", "error_column")
     @classmethod
@@ -75,6 +76,14 @@ class ExcelConfig(BaseModel):
         if not value:
             raise ValueError("column names must not be empty")
         return value
+
+    @field_validator("required_columns")
+    @classmethod
+    def _clean_required_columns(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not value for value in cleaned):
+            raise ValueError("required_columns must not contain empty names")
+        return cleaned
 
 
 class FieldConfig(BaseModel):
@@ -116,6 +125,7 @@ class GeminiConfig(BaseModel):
     max_retries: int = Field(default=3, ge=0)
     max_ai_calls: int = Field(default=50, ge=0)
     min_layout_confidence: float = Field(default=0.6, ge=0, le=1)
+    min_mapping_confidence: float = Field(default=0.6, ge=0, le=1)
 
     @field_validator("model")
     @classmethod

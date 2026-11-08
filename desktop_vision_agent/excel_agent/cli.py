@@ -1,9 +1,10 @@
 """Command-line entrypoint and environment diagnostics.
 
 Implemented: ``--check``, ``--version``, ``excel inspect`` (Segment 1),
-``inspect`` (Segment 2), ``safety test`` (Segment 3), and ``ground``
-(Segment 4). The remaining subcommands are registered now so the CLI shape is
-stable; each one reports which segment will implement it.
+``inspect`` (Segment 2), ``safety test`` (Segment 3), ``ground`` (Segment 4),
+and ``setup`` (Segment 5). The remaining subcommands are registered now so the
+CLI shape is stable; each one reports which segment will implement it.
+opencode -s ses_e4eee252cffedSGHPG9K6DizQ4
 """
 
 from __future__ import annotations
@@ -38,7 +39,6 @@ _REQUIRED_MODULES = (
 )
 
 _FUTURE_COMMANDS = {
-    "setup": "Segment 5 (mapping & approval)",
     "calibrate": "Segment 6 (first-row calibration)",
     "run": "Segment 7 (batch row runner)",
     "resume": "Segment 8 (stop/resume & state)",
@@ -162,7 +162,15 @@ def _collect_checks(config_path: str, env_path: str | None) -> list[Check]:
             )
         )
 
-    for name in ("logs", "output", "screenshots", "state", "ai_logs", "grounding"):
+    for name in (
+        "logs",
+        "output",
+        "screenshots",
+        "state",
+        "ai_logs",
+        "grounding",
+        "setup",
+    ):
         ok, detail = _writable_check(project_root() / "data" / name)
         checks.append(
             Check(
@@ -420,6 +428,32 @@ def run_safety_test(
     return 0
 
 
+def _open_target(config):
+    """Attach to the target window, capture it, and inspect its UIA tree."""
+    from .desktop.capture import capture_window
+    from .desktop.uia import inspect_window
+    from .desktop.window import attach_window
+
+    window = attach_window(config.app)
+    capture = capture_window(window)
+    inspection = inspect_window(window)
+    return window, capture, inspection
+
+
+def _mapping_headers(config, workbook) -> list[str]:
+    """Excel headers that the model may map; agent-owned columns are excluded."""
+    reserved = {
+        config.excel.status_column.strip().casefold(),
+        config.excel.timestamp_column.strip().casefold(),
+        config.excel.error_column.strip().casefold(),
+    }
+    return [
+        header
+        for header in workbook.headers
+        if header.strip().casefold() not in reserved
+    ]
+
+
 def run_ground(
     config_path: str,
     annotate: bool = True,
@@ -429,9 +463,9 @@ def run_ground(
     from .ai.client import GeminiClient, GeminiError
     from .ai.grounding import GroundingError, ground_window
     from .ai.prompts import PromptError
-    from .desktop.capture import CaptureError, capture_window
-    from .desktop.uia import UIAError, inspect_window
-    from .desktop.window import WindowError, attach_window
+    from .desktop.capture import CaptureError
+    from .desktop.uia import UIAError
+    from .desktop.window import WindowError
     from .excel.reader import ExcelReadError, read_workbook
     from .utils.images import annotate_boxes
 
@@ -440,31 +474,15 @@ def run_ground(
     try:
         config = load_config(config_path)
         workbook = read_workbook(config)
-        window = attach_window(config.app)
-        capture = capture_window(window)
-    except (ConfigError, ExcelReadError, WindowError, CaptureError) as exc:
-        print(f"ERROR: {exc}")
-        return 1
-
-    try:
-        inspection = inspect_window(window)
-    except UIAError as exc:
+        window, capture, inspection = _open_target(config)
+    except (ConfigError, ExcelReadError, WindowError, CaptureError, UIAError) as exc:
         print(f"ERROR: {exc}")
         return 1
 
     print(f"Window: 0x{window.handle:X} {window.title!r}")
     print(f"UIA candidates: {len(inspection.candidates)}")
 
-    reserved = {
-        config.excel.status_column.strip().casefold(),
-        config.excel.timestamp_column.strip().casefold(),
-        config.excel.error_column.strip().casefold(),
-    }
-    headers = [
-        header
-        for header in workbook.headers
-        if header.strip().casefold() not in reserved
-    ]
+    headers = _mapping_headers(config, workbook)
     print(f"Excel headers: {len(headers)} (agent status columns excluded)")
     print(f"Calling Gemini ({config.gemini.model})...")
 
@@ -576,6 +594,133 @@ def run_ground(
     return 0
 
 
+def run_setup(
+    config_path: str,
+    *,
+    assume_yes: bool = False,
+    mapping_path: str | None = None,
+    annotate: bool = True,
+    env_path: str | None = None,
+) -> int:
+    """Ground the target window, validate the mapping, and approve it once."""
+    from .agent.setup_flow import approve_mapping, edit_mapping, print_mapping
+    from .ai.client import GeminiClient, GeminiError
+    from .ai.grounding import GroundingError, ground_window
+    from .ai.mapping import (
+        MappingError,
+        build_mapping,
+        save_mapping,
+        validate_mapping,
+    )
+    from .ai.prompts import PromptError
+    from .desktop.capture import CaptureError
+    from .desktop.uia import UIAError
+    from .desktop.window import WindowError
+    from .excel.reader import ExcelReadError, read_workbook
+    from .utils.images import annotate_boxes
+
+    load_env(env_path)
+
+    try:
+        config = load_config(config_path)
+        workbook = read_workbook(config)
+        window, capture, inspection = _open_target(config)
+    except (ConfigError, ExcelReadError, WindowError, CaptureError, UIAError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    headers = _mapping_headers(config, workbook)
+    print(f"Window: 0x{window.handle:X} {window.title!r}")
+    print(f"UIA candidates: {len(inspection.candidates)}")
+    print(f"Excel headers: {len(headers)} (agent status columns excluded)")
+    print(f"Calling Gemini ({config.gemini.model})...")
+
+    try:
+        client = GeminiClient(config.gemini)
+        result = ground_window(
+            client,
+            capture,
+            inspection.candidates,
+            headers,
+            config.gemini,
+        )
+    except (GeminiError, GroundingError, PromptError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    mapping = build_mapping(
+        result,
+        window_title=window.title,
+        process_name=window.process_name,
+        model=config.gemini.model,
+    )
+
+    def validate(candidate):
+        return validate_mapping(
+            candidate,
+            headers=headers,
+            fields=result.fields,
+            rows=workbook.rows,
+            required_columns=config.excel.required_columns,
+            min_confidence=config.gemini.min_mapping_confidence,
+        )
+
+    validation = validate(mapping)
+    print_mapping(mapping, fields=result.fields, validation=validation)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if annotate:
+        annotated_path = (
+            project_root() / "data" / "setup" / f"setup_{stamp}_annotated.png"
+        )
+        boxes = [
+            (f"{element.element_id} {element.label}".strip(), element.rect, "red")
+            for element in result.fields.values()
+        ]
+        boxes.extend(
+            (f"{element.element_id} {element.label}".strip(), element.rect, "blue")
+            for element in result.buttons.values()
+        )
+        try:
+            annotate_boxes(capture.image, boxes, capture.origin, annotated_path)
+        except OSError as exc:
+            print(f"WARNING: could not save the annotated screenshot: {exc}")
+        else:
+            print(f"Annotated: {annotated_path}")
+
+    if not assume_yes:
+        edited = edit_mapping(mapping, headers=headers, fields=result.fields)
+        if edited is None:
+            print("Setup cancelled; no mapping was saved.")
+            return 1
+        mapping = edited
+        validation = validate(mapping)
+        print_mapping(mapping, fields=result.fields, validation=validation)
+
+    outcome = approve_mapping(mapping, validation, assume_yes=assume_yes)
+    if not outcome.approved or outcome.mapping is None:
+        print(f"Not approved: {outcome.reason}")
+        return 1
+
+    approved = outcome.mapping.model_copy(
+        update={
+            "approved_at": datetime.now()
+            .astimezone()
+            .isoformat(timespec="seconds")
+        }
+    )
+    try:
+        saved = save_mapping(approved, mapping_path)
+    except MappingError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    print()
+    print(f"Approved mapping saved: {saved}")
+    print(f"AI calls: {client.calls}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="excel-agent",
@@ -660,6 +805,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the annotated screenshot",
     )
 
+    setup_parser = subparsers.add_parser(
+        "setup", help="ground the window and approve the column mapping (Segment 5)"
+    )
+    setup_parser.add_argument("--config", default=argparse.SUPPRESS)
+    setup_parser.add_argument("--env-file", default=argparse.SUPPRESS)
+    setup_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="approve without prompting (accepts warnings)",
+    )
+    setup_parser.add_argument(
+        "--mapping",
+        default=None,
+        help="where to save the approved mapping (default: data/state/mapping.json)",
+    )
+    setup_parser.add_argument(
+        "--no-annotate",
+        action="store_true",
+        help="skip the annotated screenshot",
+    )
+
     for command, segment in _FUTURE_COMMANDS.items():
         sub = subparsers.add_parser(command, help=f"planned for {segment}")
         sub.add_argument("--config", default=argparse.SUPPRESS)
@@ -710,6 +876,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "ground":
         return run_ground(
             args.config,
+            annotate=not args.no_annotate,
+            env_path=args.env_file,
+        )
+
+    if args.command == "setup":
+        return run_setup(
+            args.config,
+            assume_yes=args.yes,
+            mapping_path=args.mapping,
             annotate=not args.no_annotate,
             env_path=args.env_file,
         )

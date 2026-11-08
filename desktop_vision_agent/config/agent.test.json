@@ -16,7 +16,8 @@
     "done_value": "DONE",
     "recheck_value": "RECHECK",
     "skip_statuses": ["DONE"],
-    "empty_cell_policy": "skip"
+    "empty_cell_policy": "skip",
+    "required_columns": ["Invoice Number", "Customer Name", "Amount"]
   },
   "fields": [
     { "column": "Invoice Number", "field": "Invoice Number", "type": "text" },
@@ -34,7 +35,8 @@
     "timeout_seconds": 60,
     "max_retries": 3,
     "max_ai_calls": 50,
-    "min_layout_confidence": 0.6
+    "min_layout_confidence": 0.6,
+    "min_mapping_confidence": 0.6
   },
   "safety": {
     "stop_hotkey": "alt+t",

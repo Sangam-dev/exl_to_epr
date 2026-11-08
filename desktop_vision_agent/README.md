@@ -5,9 +5,10 @@ them into a manually opened target application. Gemini grounds the form layout
 once; deterministic Python fills the fields, verifies the save, and writes
 `DONE` / `RECHECK` back to a copy of the workbook.
 
-> **Status: Segment 4 (Gemini grounding).** Window perception, the input layer,
-> the global input lock, stop/pause/resume, and one-shot Gemini grounding are
-> implemented. Mapping approval, calibration, and the row runner are stubs.
+> **Status: Segment 5 (mapping & approval).** Window perception, the input
+> layer, the global input lock, stop/pause/resume, one-shot Gemini grounding,
+> and one-time mapping approval are implemented. Calibration and the row runner
+> are stubs.
 
 ## Requirements
 
@@ -47,7 +48,7 @@ API key.
 | `python main.py inspect` | Implemented (Segment 2) |
 | `python main.py safety test` | Implemented (Segment 3) |
 | `python main.py ground` | Implemented (Segment 4) |
-| `python main.py setup` | Segment 5 |
+| `python main.py setup` | Implemented (Segment 5) |
 | `python main.py calibrate` | Segment 6 |
 | `python main.py run` | Segment 7 |
 | `python main.py resume` | Segment 8 |
@@ -80,6 +81,33 @@ It writes `data/grounding/grounding_<stamp>.json` and an annotated screenshot
 (red = fields, blue = buttons). Every API call is logged to `data/ai_logs`
 with credentials redacted. The model is called once per grounding run, not per
 field or per row.
+
+## Mapping approval
+
+`setup` grounds the window, validates the proposed column -> field mapping, and
+asks you to approve it once:
+
+```powershell
+..\.venv\Scripts\python.exe main.py setup --config config/agent.test.json
+```
+
+The interactive editor accepts:
+
+```text
+set <column> <field_id>   assign a column to a grounded field
+remove <column>           remove a mapping
+show                      print the current mapping
+done                      finish editing
+cancel                    abort setup
+```
+
+Approval is refused while there are validation errors (unknown or duplicate
+columns/fields, type mismatches, non-numeric values in a number column, missing
+required columns). Low-confidence entries are warnings and need an explicit
+`approve`. `--yes` approves non-interactively and accepts warnings.
+
+The approved mapping is saved to `data/state/mapping.json` (override with
+`--mapping`). Later segments reuse that file instead of asking Gemini again.
 
 ## Layout
 

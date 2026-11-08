@@ -17,6 +17,7 @@ data/state/*
 data/annotated/*
 data/logs/*
 data/grounding/*
+data/setup/*
 !data/**/.gitkeep
 
 # Logs

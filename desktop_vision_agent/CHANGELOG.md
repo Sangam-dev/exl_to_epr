@@ -3,6 +3,27 @@
 All notable changes to this project are recorded here. One entry per tagged
 segment.
 
+## [v0.6-mapping] - 2026-11-07
+
+### Added
+
+- `ai/mapping.py`: approved-mapping models, one-to-one and duplicate checks,
+  type compatibility, number-column value checks, confidence thresholds, and
+  `mapping.json` save/load with version validation.
+- `agent/setup_flow.py`: mapping table printing, interactive `set`/`remove`/
+  `show`/`done`/`cancel` editing, and explicit approval (warnings need
+  `approve`; errors block approval).
+- `python main.py setup` with `--yes`, `--mapping`, and `--no-annotate`; writes
+  the approved mapping to `data/state/mapping.json` and an annotated screenshot
+  to `data/setup/`.
+- `excel.required_columns` and `gemini.min_mapping_confidence` config options.
+- 36 mapping tests (validation, build, persistence, approval, editing).
+
+### Changed
+
+- `ground` and `setup` share the target-opening and header-filtering helpers.
+- `data/setup/*` is gitignored.
+
 ## [v0.5-ai-grounding] - 2026-11-07
 
 ### Added
