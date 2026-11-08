@@ -3,6 +3,21 @@
 All notable changes to this project are recorded here. One entry per tagged
 segment.
 
+## [v1.0] - 2026-11-08
+
+### Added
+
+- `tests/integration/`: live integration test suite for window capture (`test_capture.py`), UI Automation element tree inspection (`test_uia.py`), and test fixture form save/clear actions (`test_fixture_form.py`).
+- `scripts/test_form.py`: Tkinter test fixture matching the WinForms form, supporting PerMonitorV2 DPI awareness.
+- `scripts/demo_offline.py`: zero-API-cost demonstration script running the full agent lifecycle (grounding, mapping approval, calibration, batch runner, and resume check).
+- High-DPI awareness (Per-Monitor V2) enabled across PowerShell WinForms and Tkinter test fixtures.
+- Comprehensive troubleshooting and implemented vs. deferred feature matrix in `README.md`.
+
+### Changed
+
+- Package version bumped to `1.0.0` in `pyproject.toml` and `excel_agent/__init__.py`.
+- Synchronized accessibility names in `test_form.ps1` for real-time UIA status verification.
+
 ## [v0.9-resume] - 2026-11-08
 
 ### Added

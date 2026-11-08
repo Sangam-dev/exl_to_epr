@@ -5,10 +5,10 @@ them into a manually opened target application. Gemini grounds the form layout
 once; deterministic Python fills the fields, verifies the save, and writes
 `DONE` / `RECHECK` back to a copy of the workbook.
 
-> **Status: Segment 8 (stop/resume & state).** Run-state persistence
-> (`data/state/run_state.json`), resume from stop with re-screenshot/re-ground,
-> and `python main.py resume` — stop after Save leaves row as RECHECK, resume
-> re-screenshots and re-resolves the trusted map without re-grounding, no row
+> **Status: Segment 9 (Hardening & release, v1.0).** Full implementation of all 10
+> segments (0 through 9): unit and integration testing (278 tests), test fixture
+> forms (WinForms and Tkinter), offline zero-cost demo runner, and comprehensive
+> fault recovery.
 
 ## Requirements
 
@@ -189,6 +189,62 @@ delete `data/state/run_state.json` to start a new run.
 
 `data/state/run_state.json` is gitignored along with the other runtime state.
 
+## Offline Demonstration
+
+Run the complete pipeline (grounding, mapping, calibration, batch run, and resume)
+with zero Gemini API token usage using the included mock demonstration:
+
+```powershell
+python scripts/demo_offline.py
+```
+
+## Testing
+
+Run unit and live integration tests:
+
+```powershell
+pytest
+```
+
+To run with verbose output:
+
+```powershell
+pytest -v
+```
+
+## Troubleshooting
+
+### 1. High-DPI Scaling & Coordinates
+- Windows display scaling (125%, 150%, etc.) can cause coordinate misalignment if the target application is DPI-unaware.
+- The agent detects DPI virtualization black padding and uses PerMonitorV2 awareness.
+- When creating custom fixtures, ensure high-DPI mode is enabled.
+
+### 2. Window Not Found or Minimized
+- If `find_window` fails: verify that `app.title_contains` matches part of the visible window title.
+- Minimized windows cannot be captured or interacted with; restore the target window before running `ground`, `calibrate`, or `run`.
+
+### 3. Emergency Input Release
+- If the agent blocks your mouse/keyboard and you need immediate control: press **`Alt+T`**.
+- To temporarily pause execution: press **`Alt+P`** (and **`Alt+R`** to resume).
+- `Ctrl+Alt+Del` is preserved at the Windows OS level as an unblockable escape.
+- The background watchdog automatically releases input hooks if the process terminates or hangs.
+
+## Implemented vs. Deferred (v1.0)
+
+| Feature | Status | Notes |
+|---|:---:|---|
+| Text & Number inputs | Implemented | Filled via UIA and SendInput with clipboard fallback |
+| Single Window Forms | Implemented | Native Windows applications |
+| Visual Grounding | Implemented | Google Gemini (`gemini-3.6-flash`) |
+| First-Row Calibration | Implemented | Pre-save and post-save visual verification |
+| Deterministic Batch Entry | Implemented | 0 AI calls per clean row using pixel diffs |
+| Atomic Stop & Resume | Implemented | Idempotent state persistence via `run_state.json` |
+| Low-Level Safety Lock | Implemented | Windows hooks with emergency `Alt+T` release |
+| Combobox / Dropdowns | Deferred | Planned for v1.1 |
+| Checkboxes / Radios | Deferred | Planned for v1.1 |
+| Multi-tab / Wizards | Deferred | Planned for v1.1 |
+| Automatic App Launch | Deferred | User opens target window manually |
+
 ## Layout
 
 ```text
@@ -196,9 +252,10 @@ desktop_vision_agent/
 ├── main.py
 ├── config/            # agent.example.json + prompt drafts
 ├── excel_agent/       # application package
-├── tests/
+├── tests/             # unit and integration test suites
+├── scripts/           # test fixtures (test_form.ps1, test_form.py) and demo_offline.py
 ├── data/              # runtime input/output/screenshots/state (gitignored)
-├── docs/segments/     # per-segment notes
+├── docs/segments/     # per-segment notes (segments 00-09)
 └── legacy/            # archived experiments (not imported)
 ```
 

@@ -1,6 +1,6 @@
 [project]
 name = "excel-desktop-agent"
-version = "0.1.0"
+version = "1.0.0"
 description = "AI-first Windows desktop agent that enters Excel rows into a target application."
 requires-python = ">=3.11"
 dependencies = [

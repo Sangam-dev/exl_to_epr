@@ -5,6 +5,15 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+try {
+    [System.Windows.Forms.Application]::SetHighDpiMode([System.Windows.Forms.HighDpiMode]::PerMonitorV2)
+} catch {
+    try {
+        $user32 = Add-Type -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();' -Name "Win32Dpi" -Namespace "Win32" -PassThru
+        [Win32.Win32Dpi]::SetProcessDPIAware()
+    } catch {}
+}
+
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $form = New-Object System.Windows.Forms.Form
@@ -66,7 +75,7 @@ $clear.Width = 100
 $status = New-Object System.Windows.Forms.Label
 $status.Name = "lblStatus"
 $status.Text = "Status: ready"
-$status.AccessibleName = "Status"
+$status.AccessibleName = "Status: ready"
 $status.Left = 20
 $status.Top = 235
 $status.Width = 470
@@ -92,16 +101,19 @@ $clearFields = {
 $save.Add_Click({
     if ([string]::IsNullOrWhiteSpace($invoice.Text)) {
         $status.Text = "Status: invoice number is required"
+        $status.AccessibleName = $status.Text
         return
     }
     $record = "{0} | {1} | {2}" -f $invoice.Text, $customer.Text, $amount.Text
     [void]$saved.Items.Add($record)
     $status.Text = "Status: saved " + (Get-Date -Format "HH:mm:ss")
+    $status.AccessibleName = $status.Text
     & $clearFields
 })
 
 $clear.Add_Click({
     $status.Text = "Status: cleared"
+    $status.AccessibleName = $status.Text
     & $clearFields
 })
 

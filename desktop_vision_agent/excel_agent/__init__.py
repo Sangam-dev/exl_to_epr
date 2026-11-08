@@ -11,4 +11,4 @@ The package is organised in layers:
 * ``utils``                     - shared helpers
 """
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
