@@ -2,9 +2,9 @@
 
 Implemented: ``--check``, ``--version``, ``excel inspect`` (Segment 1),
 ``inspect`` (Segment 2), ``safety test`` (Segment 3), ``ground`` (Segment 4),
-``setup`` (Segment 5), and ``calibrate`` (Segment 6). The remaining
-subcommands are registered now so the CLI shape is stable; each one reports
-which segment will implement it.
+``setup`` (Segment 5), ``calibrate`` (Segment 6), and ``run`` (Segment 7).
+The remaining subcommands are registered now so the CLI shape is stable; each
+one reports which segment will implement it.
 """
 
 from __future__ import annotations
@@ -39,7 +39,6 @@ _REQUIRED_MODULES = (
 )
 
 _FUTURE_COMMANDS = {
-    "run": "Segment 7 (batch row runner)",
     "resume": "Segment 8 (stop/resume & state)",
 }
 
@@ -733,6 +732,7 @@ def run_calibrate(
         CalibrationError,
         calibrate_row,
     )
+    from .agent.workspace import WorkspaceError, open_workspace
     from .ai.client import GeminiClient, GeminiError
     from .ai.mapping import DEFAULT_MAPPING_PATH, MappingError, load_mapping
     from .desktop.capture import CaptureError
@@ -757,14 +757,16 @@ def run_calibrate(
 
     try:
         config = load_config(config_path)
-        workbook = read_workbook(config)
         mapping = load_mapping(mapping_file)
+    except (ConfigError, MappingError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    try:
+        workspace = open_workspace(config)
+        workbook = read_workbook(config, workspace.path)
         pending = pending_rows(workbook, config)
-    except (
-        ConfigError,
-        ExcelReadError,
-        MappingError,
-    ) as exc:
+    except (ExcelReadError, ExcelWriteError, WorkspaceError) as exc:
         print(f"ERROR: {exc}")
         return 1
 
@@ -789,7 +791,7 @@ def run_calibrate(
 
     try:
         window = attach_window(config.app)
-        writer = WorkbookWriter.from_config(config)
+        writer = WorkbookWriter.from_config(config, path=workspace.path)
         client = GeminiClient(config.gemini)
         hotkeys = hotkeys_from_config(config.safety)
     except (
@@ -862,6 +864,182 @@ def run_calibrate(
     print(f"AI calls: {client.calls}")
     print(f"Output workbook: {writer.path}")
     return 0 if result.status == config.excel.done_value else 1
+
+
+def run_batch(
+    config_path: str,
+    *,
+    mapping_path: str | None = None,
+    limit: int | None = None,
+    overlay: bool = True,
+    env_path: str | None = None,
+) -> int:
+    """Process pending rows with the trusted coordinate map."""
+    from .agent.row_runner import RunnerError, run_rows
+    from .agent.workspace import WorkspaceError, open_workspace
+    from .ai.client import GeminiClient, GeminiError
+    from .ai.mapping import DEFAULT_MAPPING_PATH, MappingError, load_mapping
+    from .desktop.capture import CaptureError
+    from .desktop.uia import UIAError
+    from .desktop.window import WindowError, attach_window
+    from .excel.reader import (
+        ExcelReadError,
+        pending_rows,
+        read_workbook,
+        validate_pending_rows,
+    )
+    from .excel.writer import ExcelWriteError, WorkbookWriter
+    from .safety.controller import SafetyController
+    from .safety.hotkeys import HotkeyError, hotkeys_from_config
+    from .safety.overlay import NullOverlay, StatusOverlay
+
+    load_env(env_path)
+
+    if limit is not None and limit < 1:
+        print(f"ERROR: --limit must be at least 1, got {limit}")
+        return 1
+
+    mapping_file = (
+        Path(mapping_path) if mapping_path is not None else DEFAULT_MAPPING_PATH
+    )
+
+    try:
+        config = load_config(config_path)
+        mapping = load_mapping(mapping_file)
+    except (ConfigError, MappingError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    if not mapping.trusted:
+        print(
+            "ERROR: the approved mapping is not trusted. Run "
+            "`python main.py calibrate` first; calibration proves the map "
+            "before a batch can use it."
+        )
+        return 1
+
+    try:
+        workspace = open_workspace(config)
+        workbook = read_workbook(config, workspace.path)
+        pending = pending_rows(workbook, config)
+    except (ExcelReadError, ExcelWriteError, WorkspaceError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    issues = validate_pending_rows(pending, config)
+    if issues:
+        print(f"ERROR: {len(issues)} validation issue(s); nothing was processed:")
+        for issue in issues:
+            print(f"  - {issue}")
+        return 1
+
+    if not pending:
+        print(f"Working copy: {workspace.path}")
+        print("No pending rows; nothing to run.")
+        return 0
+
+    selected = pending[:limit] if limit is not None else pending
+
+    try:
+        window = attach_window(config.app)
+        writer = WorkbookWriter.from_config(config, path=workspace.path)
+        client = GeminiClient(config.gemini)
+        hotkeys = hotkeys_from_config(config.safety)
+    except (
+        WindowError,
+        CaptureError,
+        UIAError,
+        ExcelWriteError,
+        GeminiError,
+        HotkeyError,
+    ) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    labels = {hotkey.action: hotkey.label for hotkey in hotkeys}
+    controller = SafetyController(
+        config.safety,
+        overlay=StatusOverlay(labels) if overlay else NullOverlay(),
+    )
+
+    print(f"Workbook: {workbook.path}")
+    print(f"Pending rows: {len(pending)}; processing: {len(selected)}")
+    print(
+        f"Mapping: {mapping_file} "
+        f"(trusted={mapping.trusted}, {len(mapping.entries)} column(s))"
+    )
+    print(f"Window: 0x{window.handle:X} {window.title!r}")
+    print(
+        f"Output copy: {workspace.path} "
+        f"({'reused' if not workspace.created else 'new'})"
+    )
+    print(
+        f"Gemini: {config.gemini.model} "
+        "(used only when the save is ambiguous)"
+    )
+    print(
+        f"  {labels['stop']} stop | {labels['pause']} pause | "
+        f"{labels['resume']} resume"
+    )
+    print()
+
+    try:
+        controller.start()
+    except Exception as exc:
+        controller.close()
+        writer.close()
+        print(f"ERROR: {exc}")
+        return 1
+
+    try:
+        result = run_rows(
+            pending,
+            config=config,
+            mapping=mapping,
+            writer=writer,
+            client=client,
+            controller=controller,
+            limit=limit,
+        )
+    except RunnerError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        controller.stop(reason="interrupted")
+        print(
+            "Interrupted; restart the run and DONE rows will be skipped."
+        )
+        return 1
+    finally:
+        controller.close()
+        writer.close()
+
+    print()
+    done = result.count(config.excel.done_value)
+    recheck = result.count(config.excel.recheck_value)
+    print(
+        f"Processed {result.processed} row(s): "
+        f"{done} {config.excel.done_value}, "
+        f"{recheck} {config.excel.recheck_value}"
+    )
+    for outcome in result.outcomes:
+        line = (
+            f"Row {outcome.row_number}: {outcome.status} "
+            f"(attempt {outcome.attempts})"
+        )
+        if outcome.error:
+            line += f" - {outcome.error}"
+        print(line)
+        for path in outcome.screenshots:
+            print(f"  screenshot: {path}")
+    if result.stopped:
+        print(f"Stopped at row {result.stopped_row}: {result.stop_reason}")
+    print(f"AI calls: {client.calls}")
+    print(f"Output workbook: {writer.path}")
+
+    if result.stopped:
+        return 1
+    return 0 if recheck == 0 else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -986,6 +1164,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not show the status overlay",
     )
 
+    run_parser = subparsers.add_parser(
+        "run", help="process pending rows with the trusted map (Segment 7)"
+    )
+    run_parser.add_argument("--config", default=argparse.SUPPRESS)
+    run_parser.add_argument("--env-file", default=argparse.SUPPRESS)
+    run_parser.add_argument(
+        "--mapping",
+        default=None,
+        help="approved mapping file (default: data/state/mapping.json)",
+    )
+    run_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="process at most N pending rows (default: all)",
+    )
+    run_parser.add_argument(
+        "--no-overlay",
+        action="store_true",
+        help="do not show the status overlay",
+    )
+
     for command, segment in _FUTURE_COMMANDS.items():
         sub = subparsers.add_parser(command, help=f"planned for {segment}")
         sub.add_argument("--config", default=argparse.SUPPRESS)
@@ -1053,6 +1253,15 @@ def main(argv: list[str] | None = None) -> int:
         return run_calibrate(
             args.config,
             mapping_path=args.mapping,
+            overlay=not args.no_overlay,
+            env_path=args.env_file,
+        )
+
+    if args.command == "run":
+        return run_batch(
+            args.config,
+            mapping_path=args.mapping,
+            limit=args.limit,
             overlay=not args.no_overlay,
             env_path=args.env_file,
         )

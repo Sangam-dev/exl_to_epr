@@ -5,10 +5,10 @@ them into a manually opened target application. Gemini grounds the form layout
 once; deterministic Python fills the fields, verifies the save, and writes
 `DONE` / `RECHECK` back to a copy of the workbook.
 
-> **Status: Segment 6 (first-row calibration).** Window perception, the input
-> layer, the global input lock, stop/pause/resume, one-shot Gemini grounding,
-> one-time mapping approval, and first-row calibration are implemented. The
-> batch row runner and stop/resume state are stubs.
+> **Status: Segment 7 (batch row runner).** Window perception, the input layer,
+> the global input lock, stop/pause/resume, one-shot Gemini grounding, one-time
+> mapping approval, first-row calibration, and batch row processing are
+> implemented. Stop/resume state across process restarts is a stub.
 
 ## Requirements
 
@@ -50,7 +50,7 @@ API key.
 | `python main.py ground` | Implemented (Segment 4) |
 | `python main.py setup` | Implemented (Segment 5) |
 | `python main.py calibrate` | Implemented (Segment 6) |
-| `python main.py run` | Segment 7 |
+| `python main.py run` | Implemented (Segment 7) |
 | `python main.py resume` | Segment 8 |
 
 ## Safety
@@ -128,6 +128,33 @@ The mapping stays `trusted: false` until both checks pass. On failure the row
 is marked `RECHECK` and the map stays untrusted. A save that may already have
 succeeded is never retried automatically, so a failed calibration cannot
 create duplicate records. `--no-overlay` disables the status overlay.
+
+## Batch run
+
+`run` processes every pending row with the trusted map:
+
+```powershell
+..\.venv\Scripts\python.exe main.py run --config config/agent.test.json
+..\.venv\Scripts\python.exe main.py run --config config/agent.test.json --limit 5
+```
+
+`run` refuses to start while the mapping is untrusted, so calibration must pass
+first. There is no override flag.
+
+Each row is filled with the same deterministic path as calibration. The save is
+judged by comparing the non-empty mapped fields before and after Save: changed
+fields mean `DONE`, unchanged fields are retried, and Gemini is called only
+when the comparison cannot decide (no comparable field or a window-size
+change). A clean run therefore makes **zero Gemini calls per row**.
+
+A save that may already have succeeded is never retried; the row is marked
+`RECHECK` instead. Rows are written and the workbook is saved after each row, so
+stopping mid-run loses nothing. Restarting `run` skips every `DONE` row.
+
+The working copy is selected once and recorded in `data/state/output.json`.
+`calibrate` and `run` reuse that same copy, which is how a calibrated row is
+skipped by the batch runner. Delete the file to start a fresh copy from the
+input workbook. `--no-overlay` disables the status overlay.
 
 ## Layout
 

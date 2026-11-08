@@ -3,6 +3,30 @@
 All notable changes to this project are recorded here. One entry per tagged
 segment.
 
+## [v0.8-batch] - 2026-11-08
+
+### Added
+
+- `agent/row_runner.py`: per-row fill/save loop over the trusted map,
+  deterministic pixel-diff save classification, Gemini only for ambiguous
+  saves, safe retry policy, layout fingerprint logging, per-row status writes,
+  and optional screenshots on failure.
+- `agent/workspace.py`: a recorded working copy (`data/state/output.json`) so
+  calibration and the batch runner reuse the same workbook copy and a
+  calibrated `DONE` row is never processed twice.
+- `python main.py run` with `--config`, `--mapping`, `--limit`, and
+  `--no-overlay`. The command refuses to start unless the mapping is trusted.
+- `RunResult` / `RowOutcome` summaries and a per-run count of `DONE` and
+  `RECHECK` rows.
+- 25 new tests (workspace selection and batch runner paths).
+
+### Changed
+
+- `calibrate` now opens the recorded working copy instead of creating a new
+  output file on every run.
+- `run` uses `safety.stop_on_failure` to decide whether to continue after a
+  `RECHECK` row.
+
 ## [v0.7-calibration] - 2026-11-08
 
 ### Added
