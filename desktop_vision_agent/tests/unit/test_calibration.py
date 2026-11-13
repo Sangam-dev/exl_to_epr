@@ -617,7 +617,7 @@ def test_calibrate_row_does_not_retry_an_uncertain_save(
     assert "may already exist" in writer.calls[0][2]
 
 
-def test_calibrate_row_retries_when_the_fields_are_unchanged(
+def test_calibrate_row_does_not_save_again_when_the_fields_are_unchanged(
     monkeypatch, tmp_path: Path
 ) -> None:
     calls = _stub_desktop(
@@ -643,7 +643,8 @@ def test_calibrate_row_retries_when_the_fields_are_unchanged(
     )
 
     assert result.status == "RECHECK"
-    assert result.attempts == 2
-    assert calls["save"] == 2
-    assert calls["post"] == 2
+    assert result.attempts == 1
+    assert calls["save"] == 1
+    assert calls["post"] == 1
     assert "unchanged" in writer.calls[0][2]
+    assert "may already exist" in writer.calls[0][2]

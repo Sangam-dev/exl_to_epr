@@ -1,0 +1,402 @@
+%% =====================================================================
+%% Excel Desktop Agent - CURRENT (V1) RUNTIME FLOWS
+%% Source of truth: desktop_vision_agent/excel_agent
+%%
+%% Several independent diagrams. Render/copy one section at a time if
+%% your viewer only shows the first diagram.
+%% =====================================================================
+
+
+%% ---------------------------------------------------------------------
+%% 1. SETUP: ground -> propose -> approve -> persist mapping
+%% ---------------------------------------------------------------------
+sequenceDiagram
+    autonumber
+    actor OP as Operator
+    participant CLI as CLI setup
+    participant CFG as config.py
+    participant XL as excel/reader.py
+    participant WIN as desktop/window.py
+    participant CAP as desktop/capture.py
+    participant UIA as desktop/uia.py
+    participant AI as ai/client.py
+    participant GR as ai/grounding.py
+    participant MAP as ai/mapping.py
+    participant SF as agent/setup_flow.py
+    participant FS as Filesystem
+
+    OP->>CLI: python main.py setup --config ... [--yes] [--mapping ...]
+    CLI->>CFG: load_config + load_env
+    CFG-->>CLI: AgentConfig
+    CLI->>XL: read_workbook(config)
+    XL-->>CLI: headers + rows (source is read-only)
+    CLI->>WIN: attach_window(app)
+    WIN->>WIN: find unique window, focus, pin on top
+    WIN-->>CLI: WindowInfo
+    CLI->>CAP: capture_window(window)
+    CAP-->>CLI: Capture(image, origin, scale, window)
+    CLI->>UIA: inspect_window(window)
+    UIA-->>CLI: UIAInspection(candidates + live controls)
+    CLI->>AI: GeminiClient(config.gemini)
+    CLI->>GR: ground_window(client, capture, candidates, headers, gemini)
+    GR->>GR: prepare_image + build_grounding_prompt
+    GR->>AI: generate_json(prompt, image)
+    AI-->>GR: JSON response (retries + max_ai_calls)
+    GR->>GR: validate schema
+    GR->>GR: normalized box to screen rect
+    GR->>GR: prefer UIA candidate rect if named
+    GR->>GR: reject rect outside captured window
+    GR->>GR: reject duplicate / unknown column or field
+    GR-->>CLI: GroundingResult
+    CLI->>MAP: build_mapping(result)
+    MAP-->>CLI: ApprovedMapping (not yet approved)
+    CLI->>MAP: validate_mapping(required cols, one-to-one, number cells, confidence)
+    MAP-->>CLI: errors + warnings + unmapped columns
+    CLI->>SF: print_mapping()
+    alt interactive and not --yes
+        CLI->>SF: edit_mapping(set / remove / show / done / cancel)
+        SF-->>CLI: edited mapping or cancel
+        CLI->>MAP: validate_mapping() again
+        CLI->>SF: print_mapping()
+    end
+    CLI->>SF: approve_mapping(assume_yes)
+    SF-->>CLI: approved or rejected
+    alt approved
+        CLI->>MAP: save_mapping(approved_at=now, trusted=False)
+        MAP-->>FS: data/state/mapping.json
+        CLI->>FS: data/setup/setup_TIMESTAMP_annotated.png
+        CLI-->>OP: mapping path + AI call count
+    else rejected
+        CLI-->>OP: "Not approved" + reason (nothing saved)
+    end
+
+
+%% ---------------------------------------------------------------------
+%% 2. CALIBRATION: prove the map on the first pending row
+%% ---------------------------------------------------------------------
+sequenceDiagram
+    autonumber
+    actor OP as Operator
+    participant CLI as CLI calibrate
+    participant WS as agent/workspace.py
+    participant XL as excel/reader.py
+    participant WR as excel/writer.py
+    participant WIN as desktop/window.py
+    participant UIA as desktop/uia.py
+    participant CAL as agent/calibration.py
+    participant IN as desktop/input.py
+    participant CAP as desktop/capture.py
+    participant AI as AI client and verification
+    participant MAP as ai/mapping.py
+    participant SAFE as safety/controller.py
+    participant FS as Filesystem
+
+    OP->>CLI: python main.py calibrate --config ... --mapping ...
+    CLI->>WS: open_workspace(config)
+    alt output.json points to an existing copy
+        WS-->>CLI: reuse working copy
+    else no usable copy
+        WS->>WR: prepare_output(config.excel)
+        WR-->>FS: copy input -> data/output/*_agent*.xlsx
+        WS-->>FS: write data/state/output.json
+        WS-->>CLI: new working copy
+    end
+    CLI->>XL: read_workbook(working copy)
+    XL-->>CLI: Workbook
+    CLI->>XL: pending_rows + validate_pending_rows
+    XL-->>CLI: first pending row (or none)
+    CLI->>WIN: attach_window(app)
+    CLI->>WR: WorkbookWriter.from_config(path=working copy)
+    CLI->>AI: GeminiClient(config.gemini)
+    CLI->>SAFE: start() -> install hooks, overlay, watchdog
+    CLI->>CAL: calibrate_row(row 1..max_attempts)
+
+    loop attempt 1..safety.max_attempts
+        CAL->>SAFE: check() / require running
+        CAL->>WIN: attach_window(app)
+        CAL->>UIA: inspect_window(window)
+        CAL->>CAL: resolve_layout(mapping, inspection)
+        Note over CAL: candidate_id first,<br/>else saved rect if inside window,<br/>else layout problem -> abort
+        CAL->>IN: fill_row(layout, values, delay)
+        loop each mapped field
+            CAL->>SAFE: check() before field
+            CAL->>IN: click(field center)
+            CAL->>SAFE: wait(action_delay)
+            CAL->>IN: Ctrl+A then paste or Delete
+            CAL->>SAFE: wait(action_delay)
+        end
+        CAL->>UIA: read_back(live values)
+        alt UIA read-back mismatch
+            CAL->>SAFE: wait(0.5)
+            Note over CAL: retry the whole row
+        else read-back OK (or no UIA control)
+            CAL->>CAP: pre-save screenshot
+            CAL->>FS: save pre_save PNG
+            CAL->>AI: check_pre_save(client, pre, entries, values)
+            alt pre-save rejected
+                CAL->>SAFE: wait(0.5)
+                Note over CAL: retry the whole row
+            else pre-save approved
+                CAL->>SAFE: require running
+                CAL->>IN: click Save
+                CAL->>SAFE: wait(wait_after_save_seconds)
+                alt stopped after Save
+                    CAL->>WR: write RECHECK "record may already exist"
+                    Note over CAL: never click Save twice
+                else
+                    CAL->>CAP: post-save screenshot
+                    CAL->>FS: save post_save PNG
+                    CAL->>CAL: compare_saved_fields(pre, post)
+                    alt fields changed
+                        CAL->>AI: check_post_save(pre, post)
+                        alt post-save approved
+                            CAL->>WR: write DONE
+                            CAL->>MAP: mark_trusted(True)
+                            CAL-->>CLI: CalibrationResult DONE
+                        else uncertain
+                            CAL->>WR: write RECHECK
+                        end
+                    else fields unchanged
+                        Note over CAL: likely already saved or form keeps values
+                        CAL->>WR: write RECHECK
+                        Note over CAL: no second Save
+                    end
+                end
+            end
+        end
+    end
+
+    CLI->>SAFE: close() -> release input, stop watchdog/overlay
+    CLI->>WR: close()
+    CLI->>WIN: unpin window
+    CLI-->>OP: row status, trusted flag, screenshots, AI calls
+
+
+%% ---------------------------------------------------------------------
+%% 3. FRESH BATCH RUN: run -> per-row loop -> run_state
+%% ---------------------------------------------------------------------
+sequenceDiagram
+    autonumber
+    actor OP as Operator
+    participant CLI as CLI run
+    participant CFG as config.py
+    participant MAP as ai/mapping.py
+    participant ST as orchestrator and state_store
+    participant WS as agent/workspace.py
+    participant XL as excel/reader.py
+    participant WR as excel/writer.py
+    participant WIN as desktop/window.py
+    participant RR as agent/row_runner.py
+    participant SAFE as safety/controller.py
+    participant FS as Filesystem
+
+    OP->>CLI: python main.py run --config ... [--limit N]
+    CLI->>CFG: load_config + load_env
+    CLI->>MAP: load_mapping(mapping path)
+    alt mapping.trusted == False
+        CLI-->>OP: ERROR: run calibrate first
+    end
+    CLI->>ST: load_run_state(path) if exists
+    alt previous run exists and is unfinished
+        CLI->>CLI: _stale_run_reason(config/mapping/input changed?)
+        alt stale reason found
+            CLI->>FS: archive run_state to run_state.stale-TIMESTAMP.json
+            CLI->>WS: adopt recorded output copy if it exists
+            Note over CLI: continue as a fresh run
+        else not stale
+            CLI-->>OP: ERROR: use resume, or delete run_state
+        end
+    end
+    CLI->>WS: open_workspace(config)
+    WS-->>CLI: working copy (reused or freshly copied)
+    CLI->>XL: read_workbook(working copy)
+    CLI->>XL: pending_rows + validate_pending_rows
+    XL-->>CLI: selected rows (or validation errors -> abort)
+    CLI->>WIN: attach_window(app)
+    CLI->>WR: WorkbookWriter.from_config(path=working copy)
+    CLI->>SAFE: start()
+    CLI->>ST: start_run(config, mapping, workspace, window, rows)
+    ST-->>FS: run_state.json with pending rows
+    CLI->>RR: run_rows(selected, ...)
+
+    loop each selected row
+        RR->>SAFE: check() before row
+        RR->>RR: run_row(row): attach, inspect, resolve_layout,<br/>fill, read back, Save, verify (diagram 4)
+        RR->>WR: write DONE or RECHECK + timestamp + error
+        WR-->>FS: atomic save of working copy
+        RR->>ST: session.record(RowOutcome) -> run_state.json
+        alt outcome != DONE and safety.stop_on_failure
+            RR-->>CLI: stopped = True, stopped_row, stop_reason
+        end
+    end
+
+    alt RunnerError or KeyboardInterrupt
+        CLI->>ST: session.abort(reason)
+    end
+    CLI->>SAFE: close()
+    CLI->>WR: close()
+    CLI->>WIN: unpin window
+    CLI->>ST: session.finish(RunResult)
+    ST-->>FS: stopped / stopped_row / stop_reason
+    CLI-->>OP: counts DONE/RECHECK, per-row outcomes, screenshots, AI calls
+
+
+%% ---------------------------------------------------------------------
+%% 4. PER-ROW STATE MACHINE (row_runner.run_row)
+%% ---------------------------------------------------------------------
+flowchart TD
+
+    START([run_row]) --> FMT{format mapped values}
+    FMT -->|invalid value| RECHECK0["write RECHECK<br/>attempts = 0"]
+    FMT -->|ok| ATTEMPT["attempt = 1..max_attempts"]
+
+    ATTEMPT --> RUNCHK{"controller.check()"}
+    RUNCHK -->|False / stopped| ABORT["RunnerAborted<br/>stop batch, row left pending"]
+    RUNCHK -->|True| ATTACH["attach_window<br/>inspect_window<br/>resolve_layout"]
+
+    ATTACH --> LAYOUT{"layout.problems?"}
+    LAYOUT -->|yes| STOPBATCH["RunnerError<br/>stop batch: mapping does not match"]
+    LAYOUT -->|no| FILL["fill_row<br/>click, Ctrl+A, paste/delete<br/>pause checked per field"]
+
+    FILL --> WAITPOST{"paused or stopped<br/>while filling?"}
+    WAITPOST -->|stopped| ABORT
+    WAITPOST -->|ok| READBACK["read_back via UIA"]
+
+    READBACK --> RB{"problems?"}
+    RB -->|yes| RETRY["wait 0.5s<br/>next attempt"]
+    RB -->|no / no UIA control| PRE["capture pre-save<br/>save screenshot"]
+
+    PRE --> PRECHK{"controller.check() before Save"}
+    PRECHK -->|False| ABORT
+    PRECHK -->|True| SAVE["click Save<br/>saved = True"]
+
+    SAVE --> SAVEWAIT{"wait_after_save<br/>paused/stopped?"}
+    SAVEWAIT -->|stopped| RECHECK_AFTER["RECHECK<br/>'stopped after Save;<br/>record may already exist'"]
+    SAVEWAIT -->|ok| POST["capture post-save<br/>save screenshot"]
+
+    POST --> CMP["compare_saved_fields<br/>pixel diff of filled fields"]
+    CMP --> KIND{"classify_save"}
+
+    KIND -->|SAVED / fields changed| DONE["write DONE"]
+    KIND -->|NOT_SAVED / fields unchanged| RECHECK_UNCHANGED["RECHECK<br/>'fields unchanged after Save;<br/>record may already exist'<br/>NO second Save"]
+    KIND -->|AMBIGUOUS| POSTAI["check_post_save<br/>Gemini before/after"]
+
+    POSTAI --> STOPPED_AI{"still running?"}
+    STOPPED_AI -->|no| RECHECK_AI["RECHECK<br/>'stopped during post-save<br/>verification'"]
+    STOPPED_AI -->|yes| AIAPPROVED{"approved AND<br/>fields changed?"}
+    AIAPPROVED -->|yes| DONE
+    AIAPPROVED -->|no| RECHECK_AI2["RECHECK<br/>uncertain save evidence"]
+
+    RETRY --> MORE{"attempt < max_attempts?"}
+    MORE -->|yes| ATTEMPT
+    MORE -->|no| RECHECK_EXHAUSTED["RECHECK<br/>row failed after N attempts"]
+
+    SAVE -.->|exception after Save| RECHECK_POSTERR["RECHECK<br/>'post-save verification failed;<br/>record may already exist'"]
+    FILL -.->|exception before Save| RETRY
+
+    DONE --> OUT([RowOutcome])
+    RECHECK0 --> OUT
+    RECHECK_AFTER --> OUT
+    RECHECK_UNCHANGED --> OUT
+    RECHECK_AI --> OUT
+    RECHECK_AI2 --> OUT
+    RECHECK_EXHAUSTED --> OUT
+    RECHECK_POSTERR --> OUT
+    ABORT --> OUT2([RunnerAborted<br/>batch stops])
+    STOPBATCH --> OUT3([RunnerError<br/>batch stops])
+
+    classDef ok fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef warn fill:#fef3c7,stroke:#d97706,color:#78350f
+    classDef bad fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    classDef neutral fill:#e5e7eb,stroke:#6b7280,color:#111827
+
+    class DONE ok
+    class RECHECK0,RECHECK_AFTER,RECHECK_UNCHANGED,RECHECK_AI,RECHECK_AI2,RECHECK_EXHAUSTED,RECHECK_POSTERR warn
+    class ABORT,STOPBATCH bad
+    class START,ATTEMPT,ATTACH,FILL,READBACK,PRE,SAVE,POST,CMP,OUT,OUT2,OUT3 neutral
+
+
+%% ---------------------------------------------------------------------
+%% 5. RESUME AND STALE-RUN DECISION TREE
+%% ---------------------------------------------------------------------
+flowchart TD
+
+    START([start a run]) --> LOAD["load config + mapping"]
+    LOAD --> TRUST{"mapping.trusted?"}
+    TRUST -->|no| ERR_TRUST["ERROR: run calibrate first"]
+    TRUST -->|yes| PREV{"run_state.json exists?"}
+
+    PREV -->|no| FRESH["fresh run"]
+    PREV -->|yes| RESUME{"resume command?"}
+
+    RESUME -->|yes| COPYOK{"recorded output copy<br/>still exists?"}
+    COPYOK -->|no| ERR_COPY["ERROR: working copy missing;<br/>restore it or delete run_state"]
+    COPYOK -->|yes| REUSE["open_workspace(preferred=recorded copy)"]
+    REUSE --> VALIDATE["resume_run: validate config, mapping,<br/>input, output, mapping_approved_at,<br/>pending rows, completed rows"]
+    VALIDATE --> VOK{"valid?"}
+    VOK -->|no| ERR_VALID["ERROR: run belongs to a different<br/>config/mapping/workbook"]
+    VOK -->|yes| PREFLIGHT["resume_preflight:<br/>screenshot + UIA + resolve_layout +<br/>compare layout fingerprint"]
+    PREFLIGHT --> POK{"layout.problems?"}
+    POK -->|yes| ERR_LAYOUT["ERROR: live layout does not match;<br/>run setup again"]
+    POK -->|no| SELECT["resume_rows:<br/>skip completed rows;<br/>skip any row that now has a status"]
+    SELECT --> REMAIN{"rows remaining?"}
+    REMAIN -->|no| FINISH["session.finish(empty)<br/>nothing left"]
+    REMAIN -->|yes| RUN["process remaining rows"]
+
+    RESUME -->|no| UNFIN{"previous run unfinished?"}
+    UNFIN -->|no| FRESH
+    UNFIN -->|yes| STALE{"stale reason?<br/>config path changed /<br/>mapping path changed /<br/>input path changed /<br/>mapping re-approved"}
+
+    STALE -->|yes| ARCHIVE["archive run_state as<br/>run_state.stale-TIMESTAMP.json"]
+    ARCHIVE --> ADOPT{"recorded output copy exists<br/>and same input?"}
+    ADOPT -->|yes| ADOPTED["adopt recorded copy into output.json"]
+    ADOPT -->|no| KEEP["keep current output pointer"]
+    ADOPTED --> FRESH
+    KEEP --> FRESH
+
+    STALE -->|no| COPY2{"recorded output copy exists?"}
+    COPY2 -->|no| ERR_COPY2["ERROR: working copy missing"]
+    COPY2 -->|yes| ERR_RESUME["ERROR: stopped run recorded;<br/>use resume or delete run_state"]
+
+    FRESH --> PENDING["read working copy<br/>pending_rows + validate"]
+    PENDING --> RUN
+
+    classDef ok fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef warn fill:#fef3c7,stroke:#d97706,color:#78350f
+    classDef bad fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    classDef neutral fill:#e5e7eb,stroke:#6b7280,color:#111827
+
+    class FRESH,REUSE,SELECT,RUN,FINISH,ADOPTED ok
+    class ARCHIVE,ERR_RESUME,ERR_COPY2 warn
+    class ERR_TRUST,ERR_COPY,ERR_VALID,ERR_LAYOUT bad
+    class START,LOAD,TRUST,PREV,RESUME,COPYOK,VALIDATE,VOK,PREFLIGHT,POK,REMAIN,UNFIN,STALE,ADOPT,KEEP,PENDING,COPY2 neutral
+
+
+%% ---------------------------------------------------------------------
+%% 6. SAVE VERDICT RULES (the duplicate-safety core)
+%% ---------------------------------------------------------------------
+flowchart LR
+
+    PRE["pre-save capture"] --> SAVE["click Save once"]
+    SAVE --> POST["post-save capture"]
+    POST --> CMP{"compare filled field crops"}
+
+    CMP -->|all identical| NOTSAVED["NOT_SAVED<br/>fields unchanged"]
+    CMP -->|some changed| SAVED["SAVED<br/>fields changed"]
+    CMP -->|no comparable field / window size changed| AMB["AMBIGUOUS"]
+
+    NOTSAVED --> R1["RECHECK<br/>assume the record may exist<br/>never click Save again"]
+    SAVED --> D1["DONE<br/>no AI call"]
+    AMB --> AI["Gemini post-save check"]
+
+    AI -->|approved AND changed| D2["DONE"]
+    AI -->|rejected or uncertain| R2["RECHECK"]
+    AI -->|stopped or error after Save| R3["RECHECK<br/>record may already exist"]
+
+    classDef ok fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef warn fill:#fef3c7,stroke:#d97706,color:#78350f
+    classDef neutral fill:#e5e7eb,stroke:#6b7280,color:#111827
+
+    class D1,D2 ok
+    class R1,R2,R3 warn
+    class PRE,SAVE,POST,CMP,NOTSAVED,SAVED,AMB,AI neutral

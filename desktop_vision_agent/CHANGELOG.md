@@ -3,6 +3,32 @@
 All notable changes to this project are recorded here. One entry per tagged
 segment.
 
+## [Unreleased]
+
+### Fixed
+
+- A save is never clicked twice when the post-save comparison sees unchanged
+  fields. Both `calibrate` and `run` now mark the row `RECHECK` with "the record
+  may already exist" instead of retrying, so forms that keep their values after
+  saving cannot create duplicate records.
+- `RECHECK` rows are skipped by default (`excel.skip_statuses` now defaults to
+  `["DONE", "RECHECK"]`), so a follow-up `run` cannot silently reprocess rows
+  that were flagged for human review.
+- `safety.stop_on_failure` now records the run as stopped (`stopped`,
+  `stopped_row`, `stop_reason`) so the remaining rows can be resumed instead of
+  appearing complete.
+- `run` checks for a stopped run *before* opening the working copy, so a
+  refused run can no longer replace `data/state/output.json`. A run state that
+  can never be resumed (config/mapping/input changed, or the mapping was
+  re-approved) is archived as `run_state.stale-<stamp>.json` and the copy it
+  recorded is kept, instead of blocking every future run.
+- `resume` reuses the exact working copy recorded in the run state even when
+  `output.json` points elsewhere, and repairs the pointer.
+- A missing working copy now blocks with an actionable error instead of
+  silently copying the input workbook again (which would lose every DONE or
+  RECHECK status and risk duplicate records).
+- The wizard writes `skip_statuses` with both `DONE` and `RECHECK`.
+
 ## [v1.0] - 2026-11-08
 
 ### Added

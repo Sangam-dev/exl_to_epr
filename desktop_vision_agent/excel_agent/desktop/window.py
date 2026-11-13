@@ -5,6 +5,8 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wintypes
 import os
+from contextlib import contextmanager
+from typing import Generator
 
 import win32api
 import win32con
@@ -235,11 +237,39 @@ def focus_window(window: WindowInfo) -> bool:
     return is_foreground(hwnd)
 
 
+def pin_window(hwnd: int, pin: bool = True) -> bool:
+    """Pin the target window always-on-top, or unpin it to normal z-order."""
+    flags = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW
+    insert_after = win32con.HWND_TOPMOST if pin else win32con.HWND_NOTOPMOST
+    try:
+        win32gui.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags)
+        return True
+    except Exception:
+        return False
+
+
+@contextmanager
+def pinned_window(hwnd: int, pin: bool = True) -> Generator[None, None, None]:
+    """Context manager to bring a window in front and pin it on top during the block."""
+    if pin:
+        pin_window(hwnd, True)
+    try:
+        yield
+    finally:
+        if pin:
+            pin_window(hwnd, False)
+
+
 def attach_window(config: AppConfig) -> WindowInfo:
-    """Find the target window and, if required, bring it to the foreground."""
+    """Find the target window, bring it to the foreground, and optionally pin it."""
     window = find_window(config.title_contains, config.process_name)
 
-    if win32gui.IsIconic(window.handle):
+    should_focus = (
+        win32gui.IsIconic(window.handle)
+        or config.require_foreground
+        or getattr(config, "pin_window", True)
+    )
+    if should_focus:
         focus_window(window)
         window = get_window(window.handle)
 
@@ -251,6 +281,9 @@ def attach_window(config: AppConfig) -> WindowInfo:
         raise WindowFocusError(
             "target window is not in the foreground; click it once and retry"
         )
+
+    if getattr(config, "pin_window", True):
+        pin_window(window.handle, True)
 
     return window
 

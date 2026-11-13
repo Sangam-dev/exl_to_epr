@@ -1,0 +1,112 @@
+%% =====================================================================
+%% Excel Desktop Agent - HIGH-LEVEL ARCHITECTURE (V1)
+%%
+%% Two views:
+%%   1. System context: who talks to what
+%%   2. Operating lifecycle: setup once -> run many -> resume on stop
+%%
+%% This intentionally hides module internals. See architecture.mmd and
+%% flows.mmd for the implementation-level view.
+%% =====================================================================
+
+
+%% ---------------------------------------------------------------------
+%% 1. SYSTEM CONTEXT
+%% ---------------------------------------------------------------------
+flowchart LR
+
+    classDef human fill:#fef3c7,stroke:#d97706,color:#78350f
+    classDef agent fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+    classDef external fill:#f3f4f6,stroke:#6b7280,color:#111827
+    classDef store fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef output fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+
+    OP(["Operator<br/>setup + exception review"]):::human
+
+    subgraph AGENT["Excel Desktop Agent"]
+        direction TB
+        CLI["CLI / Wizard"]
+        SETUP["Setup<br/>grounding + mapping approval"]
+        CAL["Calibration<br/>prove the map on one row"]
+        RUN["Batch Runner<br/>deterministic row loop"]
+        SAFE["Safety Controller<br/>pause / resume / stop / watchdog"]
+        STATE["State and Audit"]
+
+        CLI --> SETUP
+        SETUP --> CAL
+        CAL --> RUN
+        SAFE -.-> CAL
+        SAFE -.-> RUN
+        CAL --> STATE
+        RUN --> STATE
+    end
+
+    SRC[("Source workbook<br/>read-only")]:::store
+    CFG[("Agent config")]:::store
+    TARGET["Target desktop<br/>application"]:::external
+    GEMINI["Gemini API"]:::external
+    WORK[("Working-copy workbook<br/>DONE / RECHECK")]:::output
+    ART[("Mapping, run state,<br/>screenshots, AI logs")]:::store
+
+    OP -->|initial review| CLI
+    OP -.->|only after a safe stop| STATE
+    SRC -->|read| CLI
+    CFG -->|load| CLI
+
+    SETUP <-->|screenshot + UI tree| TARGET
+    CAL <-->|fill, Save, verify| TARGET
+    RUN <-->|fill, Save, verify| TARGET
+
+    SETUP <-->|vision grounding, once| GEMINI
+    CAL <-->|only when Save is ambiguous| GEMINI
+
+    CAL -->|status writes| WORK
+    RUN -->|status writes| WORK
+    STATE --> ART
+    WORK -->|review exceptions| OP
+
+
+%% ---------------------------------------------------------------------
+%% 2. OPERATING LIFECYCLE
+%% ---------------------------------------------------------------------
+flowchart LR
+
+    classDef once fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+    classDef auto fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef warn fill:#fef3c7,stroke:#d97706,color:#78350f
+    classDef stop fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+
+    subgraph ONCE["ONE-TIME — human approves"]
+        direction TB
+        A["1. Configure<br/>window, workbook, columns"]:::once
+        B["2. Ground + approve mapping<br/>AI-assisted"]:::once
+        C["3. Calibrate<br/>first row proves the map"]:::once
+        A --> B --> C
+    end
+
+    subgraph AUTO["PER BATCH — no human needed"]
+        direction TB
+        D["4. Run<br/>deterministic row loop<br/>AI only if a save is ambiguous"]:::auto
+        E{"Row verdict"}:::auto
+        F["DONE"]:::auto
+        G["RECHECK / safe stop"]:::warn
+        D --> E
+        E -->|save verified| F
+        E -->|uncertain or unsafe| G
+    end
+
+    subgraph RECOVER["EXCEPTION PATH"]
+        direction TB
+        H["5. Resume<br/>revalidate layout + skip finished rows"]:::warn
+    end
+
+    I["Batch summary<br/>counts, errors, screenshots"]:::auto
+
+    C --> D
+    G --> H
+    H --> D
+    F --> I
+    G --> I
+
+    note1["Human boundary:<br/>setup, mapping approval,<br/>and review of RECHECK rows"]:::warn
+    ONCE -.-> note1

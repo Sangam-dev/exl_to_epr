@@ -10,6 +10,7 @@ from openpyxl import Workbook, load_workbook
 
 from excel_agent.agent.workspace import (
     WorkspaceError,
+    WorkspaceState,
     load_workspace_state,
     open_workspace,
     save_workspace_state,
@@ -65,6 +66,32 @@ def test_open_workspace_creates_and_records_a_copy(tmp_path: Path) -> None:
     assert recorded.output_path == str(workspace.path)
 
 
+def test_open_workspace_uses_a_preferred_copy_and_repairs_the_pointer(
+    tmp_path: Path,
+) -> None:
+    source = _make_source(tmp_path / "input.xlsx")
+    config = _config(source, tmp_path / "output.xlsx")
+    state = tmp_path / "state" / "output.json"
+
+    first = open_workspace(config, state)
+    # Simulate a stray command pointing the workspace at another copy.
+    save_workspace_state(
+        WorkspaceState(
+            input_path=str(source.resolve()),
+            output_path=str(tmp_path / "elsewhere.xlsx"),
+        ),
+        state,
+    )
+
+    reused = open_workspace(config, state, preferred_path=first.path)
+
+    assert not reused.created
+    assert reused.path == first.path.resolve()
+    current = load_workspace_state(state)
+    assert current is not None
+    assert current.output_path == str(first.path.resolve())
+
+
 def test_open_workspace_reuses_the_recorded_copy(tmp_path: Path) -> None:
     source = _make_source(tmp_path / "input.xlsx")
     config = _config(source, tmp_path / "output.xlsx")
@@ -82,7 +109,9 @@ def test_open_workspace_reuses_the_recorded_copy(tmp_path: Path) -> None:
     assert load_workbook(second.path)["Rows"]["B2"].value == "Edited"
 
 
-def test_open_workspace_recreates_when_the_copy_is_missing(tmp_path: Path) -> None:
+def test_open_workspace_refuses_when_the_recorded_copy_is_missing(
+    tmp_path: Path,
+) -> None:
     source = _make_source(tmp_path / "input.xlsx")
     config = _config(source, tmp_path / "output.xlsx")
     state = tmp_path / "state" / "output.json"
@@ -90,11 +119,27 @@ def test_open_workspace_recreates_when_the_copy_is_missing(tmp_path: Path) -> No
     first = open_workspace(config, state)
     first.path.unlink()
 
+    with pytest.raises(WorkspaceError, match="working copy recorded"):
+        open_workspace(config, state)
+
+    assert not first.path.exists()
+
+
+def test_open_workspace_starts_fresh_after_the_pointer_is_removed(
+    tmp_path: Path,
+) -> None:
+    source = _make_source(tmp_path / "input.xlsx")
+    config = _config(source, tmp_path / "output.xlsx")
+    state = tmp_path / "state" / "output.json"
+
+    first = open_workspace(config, state)
+    first.path.unlink()
+    state.unlink()
+
     second = open_workspace(config, state)
 
     assert second.created
     assert second.path.is_file()
-    assert second.path == first.path
 
 
 def test_open_workspace_starts_over_for_a_different_input(tmp_path: Path) -> None:

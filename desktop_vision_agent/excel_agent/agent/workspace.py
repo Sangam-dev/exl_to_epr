@@ -112,20 +112,43 @@ def save_workspace_state(
 
 
 def open_workspace(
-    config: AgentConfig, state_path: str | Path | None = None
+    config: AgentConfig,
+    state_path: str | Path | None = None,
+    preferred_path: str | Path | None = None,
 ) -> Workspace:
     """Reuse the recorded working copy, or create a fresh one from the input.
 
     A recorded copy is reused only when it still exists and belongs to the same
-    input workbook. Otherwise a new copy is created and recorded.
+    input workbook. ``preferred_path`` lets a resume use the exact copy recorded
+    in the run state even if the pointer file was changed in the meantime.
     """
     input_path = resolve_path(config.excel.input_path).resolve()
+
+    if preferred_path is not None:
+        preferred = Path(preferred_path)
+        if preferred.is_file() and preferred.resolve() != input_path:
+            resolved = preferred.resolve()
+            save_workspace_state(
+                WorkspaceState(
+                    input_path=str(input_path),
+                    output_path=str(resolved),
+                ),
+                state_path,
+            )
+            return Workspace(path=resolved, created=False)
+
     state = load_workspace_state(state_path)
 
     if state is not None and state.input_path == str(input_path):
         output = Path(state.output_path)
         if output.is_file() and output.resolve() != input_path:
             return Workspace(path=output, created=False)
+        raise WorkspaceError(
+            f"the working copy recorded at {state.output_path} is missing. "
+            "Restore that file to keep its DONE/RECHECK statuses, or delete "
+            f"{_state_file(state_path)} to start over from the input workbook "
+            "(rows already saved in the form may be processed again)."
+        )
 
     output = prepare_output(config.excel)
     save_workspace_state(

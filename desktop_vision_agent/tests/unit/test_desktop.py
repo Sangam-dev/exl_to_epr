@@ -167,3 +167,30 @@ def test_annotate_candidates_skips_offscreen_boxes(tmp_path: Path) -> None:
 
     assert output.is_file()
     assert Image.open(output).getpixel((0, 0)) == (255, 255, 255)
+
+
+def test_pin_and_unpin_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    from excel_agent.desktop.window import pin_window, pinned_window
+    import win32con
+
+    calls = []
+
+    def mock_set_window_pos(hwnd, insert_after, x, y, cx, cy, flags):
+        calls.append((hwnd, insert_after, flags))
+        return 1
+
+    monkeypatch.setattr("win32gui.SetWindowPos", mock_set_window_pos)
+
+    assert pin_window(100, pin=True) is True
+    assert pin_window(100, pin=False) is True
+    assert len(calls) == 2
+    assert calls[0][1] == win32con.HWND_TOPMOST
+    assert calls[1][1] == win32con.HWND_NOTOPMOST
+
+    calls.clear()
+    with pinned_window(200):
+        assert len(calls) == 1
+        assert calls[0] == (200, win32con.HWND_TOPMOST, win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW)
+    assert len(calls) == 2
+    assert calls[1] == (200, win32con.HWND_NOTOPMOST, win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW)
+

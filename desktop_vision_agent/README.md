@@ -42,6 +42,7 @@ API key.
 
 | Command | Status |
 |---|---|
+| `python main.py --agent` | Interactive AI Assistant Wizard |
 | `python main.py --check` | Implemented (Segment 0) |
 | `python main.py --version` | Implemented (Segment 0) |
 | `python main.py excel inspect` | Implemented (Segment 1) |
@@ -52,6 +53,22 @@ API key.
 | `python main.py calibrate` | Implemented (Segment 6) |
 | `python main.py run` | Implemented (Segment 7) |
 | `python main.py resume` | Implemented (Segment 8) |
+
+## Interactive Agent Wizard (`--agent`)
+
+The easiest way to run the agent on your own custom application and Excel file:
+
+```powershell
+..\.venv\Scripts\python.exe main.py --agent
+```
+
+The interactive wizard:
+1. Lists open windows and lets you pick or search for your application.
+2. Asks for your Excel file path, verifies sheets, and detects column headers.
+3. Automatically generates a tailored configuration file.
+4. Executes visual layout grounding with Gemini and gets your approval.
+5. Runs first-row calibration to earn trust for the mapping.
+6. Prompts *"Do you want to start automation?"* and begins batch processing on your go.
 
 ## Safety
 
@@ -143,18 +160,23 @@ first. There is no override flag.
 
 Each row is filled with the same deterministic path as calibration. The save is
 judged by comparing the non-empty mapped fields before and after Save: changed
-fields mean `DONE`, unchanged fields are retried, and Gemini is called only
-when the comparison cannot decide (no comparable field or a window-size
-change). A clean run therefore makes **zero Gemini calls per row**.
+fields mean `DONE`, while unchanged fields are marked `RECHECK` without clicking
+Save again. Gemini is called only when the comparison cannot decide (no
+comparable field or a window-size change). A clean run therefore makes **zero
+Gemini calls per row**.
 
 A save that may already have succeeded is never retried; the row is marked
 `RECHECK` instead. Rows are written and the workbook is saved after each row, so
-stopping mid-run loses nothing. Restarting `run` skips every `DONE` row.
+stopping mid-run loses nothing. Restarting `run` skips every `DONE` and
+`RECHECK` row by default (`excel.skip_statuses`).
 
 The working copy is selected once and recorded in `data/state/output.json`.
 `calibrate` and `run` reuse that same copy, which is how a calibrated row is
-skipped by the batch runner. Delete the file to start a fresh copy from the
-input workbook. `--no-overlay` disables the status overlay.
+skipped by the batch runner. Delete that file to start a fresh copy from the
+input workbook. If the recorded copy itself is missing, the agent refuses to
+start rather than silently copying the input again, because that would lose
+every status and risk duplicate records. `--no-overlay` disables the status
+overlay.
 
 ## Stop and resume
 
@@ -180,12 +202,18 @@ Continue later:
 ```
 
 `resume` refuses to start unless the mapping, config, input workbook, and
-working copy all match the recorded run. It re-screenshots, re-inspects UIA,
-and re-resolves the trusted map before touching the next row. If the form
-layout changed structurally, it stops and asks you to run `setup` again; it
-never re-grounds unattended. A stopped run can only be resumed — running `run`
-again reports the recorded stop and tells you to use `resume` instead, or to
-delete `data/state/run_state.json` to start a new run.
+working copy all match the recorded run. It reuses the exact working copy
+recorded in the run state (repairing `output.json` if needed), re-screenshots,
+re-inspects UIA, and re-resolves the trusted map before touching the next row.
+If the form layout changed structurally, it stops and asks you to run `setup`
+again; it never re-grounds unattended.
+
+A recorded run that can never be resumed — because the config, mapping, or
+input workbook changed, or because the mapping was re-approved — is moved aside
+as `run_state.stale-<timestamp>.json` and `run` starts a fresh batch on the
+copy that run was using. A run whose working copy is missing blocks instead:
+restore the copy, or delete the run state (and `output.json`) to start over,
+accepting that rows already saved in the form may be processed again.
 
 `data/state/run_state.json` is gitignored along with the other runtime state.
 

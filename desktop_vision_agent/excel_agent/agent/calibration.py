@@ -687,10 +687,21 @@ def calibrate_row(
                 message = "; ".join(post_verdict.issues) or (
                     "the filled fields are unchanged"
                 )
-                issues.append(f"attempt {attempt}: post-save: {message}")
-                output(f"  post-save rejected: {message}")
-                _wait(controller, 0.5)
-                continue
+                return _recheck(
+                    row,
+                    config,
+                    writer,
+                    mapping,
+                    mapping_path,
+                    error=(
+                        "the filled fields are unchanged after Save; the "
+                        "record may already exist, so the row was not saved "
+                        f"again: {message}"
+                    ),
+                    attempts=attempt,
+                    screenshots=screenshots,
+                    output=output,
+                )
 
             message = "; ".join(post_verdict.issues) or "no reason given"
             return _recheck(

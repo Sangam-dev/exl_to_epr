@@ -337,11 +337,21 @@ def run_row(
             persist(post, "post_save")
 
             if kind == NOT_SAVED:
-                message = "the filled fields are unchanged after Save"
+                message = (
+                    "the filled fields are unchanged after Save; the record "
+                    "may already exist, so the row was not saved again"
+                )
                 issues.append(f"attempt {attempt}: {message}")
                 output(f"  save not detected: {message}")
-                _wait(controller, 0.5)
-                continue
+                return _finish(
+                    writer,
+                    row,
+                    config.excel.recheck_value,
+                    error=message,
+                    attempts=attempt,
+                    screenshots=screenshots,
+                    output=output,
+                )
 
             verdict = check_post_save(
                 client,
@@ -527,7 +537,13 @@ def run_rows(
             outcome.status != config.excel.done_value
             and config.safety.stop_on_failure
         ):
-            output("Stopping because safety.stop_on_failure is enabled.")
+            stopped = True
+            stopped_row = row.row_number
+            stop_reason = (
+                f"row {row.row_number} finished as {outcome.status} and "
+                "safety.stop_on_failure is enabled"
+            )
+            output(f"Stopping: {stop_reason}")
             break
 
     return RunResult(

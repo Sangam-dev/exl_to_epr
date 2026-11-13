@@ -15,7 +15,7 @@
     "error_column": "Agent Error",
     "done_value": "DONE",
     "recheck_value": "RECHECK",
-    "skip_statuses": ["DONE"],
+    "skip_statuses": ["DONE", "RECHECK"],
     "empty_cell_policy": "skip",
     "required_columns": []
   },

@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import __version__
-from .config import ConfigError, load_config, load_env, project_root
+from .config import ConfigError, load_config, load_env, project_root, resolve_path
 from .logging_setup import mask_secret, setup_logging
 
 _REQUIRED_MODULES = (    ("pydantic", "configuration models"),
@@ -846,6 +846,9 @@ def run_calibrate(
     finally:
         controller.close()
         writer.close()
+        if "window" in locals() and getattr(config.app, "pin_window", True):
+            from .desktop.window import pin_window
+            pin_window(window.handle, False)
 
     print()
     print(f"Row {result.row_number}: {result.status}")
@@ -858,6 +861,67 @@ def run_calibrate(
     print(f"AI calls: {client.calls}")
     print(f"Output workbook: {writer.path}")
     return 0 if result.status == config.excel.done_value else 1
+
+
+def _abs_path(value: str | Path) -> str:
+    return str(resolve_path(value).resolve())
+
+
+def _stale_run_reason(
+    previous,
+    *,
+    config_path: str,
+    mapping_path: str,
+    config,
+    mapping,
+) -> str:
+    """Explain why a recorded run can never be resumed, or return ""."""
+    checks = (
+        ("the config file changed", previous.config_path, _abs_path(config_path)),
+        ("the mapping file changed", previous.mapping_path, _abs_path(mapping_path)),
+        (
+            "the input workbook changed",
+            previous.input_path,
+            _abs_path(config.excel.input_path),
+        ),
+    )
+    for reason, recorded, current in checks:
+        if recorded and recorded != current:
+            return reason
+    if (
+        previous.mapping_approved_at
+        and mapping.approved_at
+        and previous.mapping_approved_at != mapping.approved_at
+    ):
+        return "the mapping was re-approved after this run stopped"
+    return ""
+
+
+def _archive_run_state(path: Path) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive = path.with_name(f"{path.stem}.stale-{stamp}{path.suffix}")
+    path.replace(archive)
+    return archive
+
+
+def _prefer_recorded_copy(
+    previous, config, state_path: str | Path | None = None
+) -> Path | None:
+    """Point the workspace back at the copy recorded by a stale run."""
+    from .agent.workspace import WorkspaceState, save_workspace_state
+
+    input_path = _abs_path(config.excel.input_path)
+    if previous.input_path != input_path:
+        return None
+    output = Path(previous.output_path)
+    if not output.is_file():
+        return None
+    resolved = output.resolve()
+    save_workspace_state(
+        WorkspaceState(input_path=input_path, output_path=str(resolved)),
+        state_path,
+    )
+    return resolved
 
 
 def run_batch(
@@ -883,7 +947,7 @@ def run_batch(
         resume_run,
         start_run,
     )
-    from .agent.row_runner import RunnerError, run_rows
+    from .agent.row_runner import RunnerError, RunResult, run_rows
     from .agent.state_store import (
         DEFAULT_RUN_STATE,
         StateError,
@@ -939,8 +1003,85 @@ def run_batch(
         )
         return 1
 
+    # Resolve any recorded run state before touching the working copy, so a
+    # refused fresh run cannot replace output.json.
     try:
-        workspace = open_workspace(config)
+        previous = load_run_state(state_file) if state_file.is_file() else None
+    except StateError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    if not resume and previous is not None and previous.unfinished:
+        reason = _stale_run_reason(
+            previous,
+            config_path=config_path,
+            mapping_path=mapping_file,
+            config=config,
+            mapping=mapping,
+        )
+        if reason:
+            try:
+                archived = _archive_run_state(state_file)
+            except OSError as exc:
+                print(
+                    f"ERROR: cannot archive the stale run state {state_file}: "
+                    f"{exc}. Delete it manually to start a new run."
+                )
+                return 1
+            try:
+                adopted = _prefer_recorded_copy(previous, config)
+            except WorkspaceError as exc:
+                print(
+                    "WARNING: could not restore the recorded working copy: "
+                    f"{exc}"
+                )
+                adopted = None
+            print(
+                f"WARNING: ignoring a stale run state ({reason}); moved it "
+                f"to {archived.name}."
+            )
+            if adopted is not None:
+                print(f"  Keeping the recorded working copy: {adopted}")
+            previous = None
+        else:
+            if previous.output_path and not Path(previous.output_path).is_file():
+                print(
+                    f"ERROR: the run recorded at {state_file} cannot be "
+                    "resumed because its working copy is missing "
+                    f"({previous.output_path}). Restore that file, or delete "
+                    "the run state to start over (rows already saved in the "
+                    "form may be processed again)."
+                )
+            else:
+                print(
+                    f"ERROR: a stopped run is recorded at {state_file}. Use "
+                    "`python main.py resume` to finish it, or delete that file "
+                    "to start a new run."
+                )
+            return 1
+
+    if (
+        resume
+        and previous is not None
+        and previous.output_path
+        and not Path(previous.output_path).is_file()
+    ):
+        print(
+            "ERROR: this run cannot be resumed because its working copy is "
+            f"missing ({previous.output_path}). Restore that file, or delete "
+            f"{state_file} to start over (rows already saved in the form may "
+            "be processed again)."
+        )
+        return 1
+
+    preferred = (
+        previous.output_path
+        if resume and previous is not None and previous.output_path
+        else None
+    )
+
+    try:
+        workspace = open_workspace(config, preferred_path=preferred)
         workbook = read_workbook(config, workspace.path)
     except (ExcelReadError, ExcelWriteError, WorkspaceError) as exc:
         print(f"ERROR: {exc}")
@@ -986,22 +1127,14 @@ def run_batch(
             return 0
         selected = pending[:limit] if limit is not None else pending
 
-        try:
-            previous = load_run_state(state_file)
-        except StateError as exc:
-            print(f"ERROR: {exc}")
-            return 1
-        if previous is not None and previous.unfinished:
-            print(
-                f"ERROR: a stopped run is recorded at {state_file}. Use "
-                "`python main.py resume` to finish it, or delete that file "
-                "to start a new run."
-            )
-            return 1
-
     if not selected:
         print(f"Run state: {state_file}")
         print("Nothing left to process for this run.")
+        if session is not None:
+            try:
+                session.finish(RunResult())
+            except StateError as exc:
+                print(f"WARNING: could not clear the finished run state: {exc}")
         return 0
 
     try:
@@ -1158,6 +1291,9 @@ def run_batch(
     finally:
         controller.close()
         writer.close()
+        if "window" in locals() and getattr(config.app, "pin_window", True):
+            from .desktop.window import pin_window
+            pin_window(window.handle, False)
 
     try:
         session.finish(result)
@@ -1227,6 +1363,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--check",
         action="store_true",
         help="check Python, dependencies, .env, config, and desktop support",
+    )
+    parser.add_argument(
+        "--agent",
+        action="store_true",
+        help="interactive AI assistant wizard to guide setup, calibration, and automation",
     )
     parser.add_argument(
         "--config",
@@ -1387,6 +1528,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not show the status overlay",
     )
 
+    agent_parser = subparsers.add_parser(
+        "agent", help="interactive AI assistant wizard to guide setup, calibration, and automation"
+    )
+    agent_parser.add_argument("--config", default=argparse.SUPPRESS)
+    agent_parser.add_argument("--env-file", default=argparse.SUPPRESS)
+
     return parser
 
 
@@ -1400,6 +1547,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         return run_check(args.config, args.env_file)
+
+    if getattr(args, "agent", False) or args.command == "agent":
+        from .agent.wizard import run_wizard
+        return run_wizard(
+            config_path=getattr(args, "config", None),
+            env_path=getattr(args, "env_file", None),
+        )
 
     if args.command is None:
         parser.print_help()

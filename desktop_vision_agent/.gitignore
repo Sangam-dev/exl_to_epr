@@ -22,3 +22,7 @@ data/setup/*
 
 # Logs
 *.log
+
+# Interactive wizard generated configs
+config/agent.interactive.json
+config/agent.run*.json

@@ -1,0 +1,646 @@
+%% =====================================================================
+%% Excel Desktop Agent - CURRENT (V1) ARCHITECTURE
+%% Source of truth: desktop_vision_agent/excel_agent
+%%
+%% Rendering:
+%%   - VS Code: Markdown Preview Mermaid Support
+%%   - mermaid.live / mermaid-cli (mmdc)
+%% This file contains several independent diagrams. Render/copy one
+%% section at a time if your viewer only shows the first diagram.
+%% =====================================================================
+
+
+%% ---------------------------------------------------------------------
+%% 1. LAYERED COMPONENT ARCHITECTURE
+%% ---------------------------------------------------------------------
+flowchart TB
+
+    classDef entry fill:#111827,color:#ffffff,stroke:#000000
+    classDef command fill:#374151,color:#ffffff,stroke:#111827
+    classDef agent fill:#1d4ed8,color:#ffffff,stroke:#1e3a8a
+    classDef ai fill:#7c3aed,color:#ffffff,stroke:#5b21b6
+    classDef desktop fill:#047857,color:#ffffff,stroke:#065f46
+    classDef excel fill:#b45309,color:#ffffff,stroke:#92400e
+    classDef safety fill:#b91c1c,color:#ffffff,stroke:#7f1d1d
+    classDef foundation fill:#4b5563,color:#ffffff,stroke:#1f2937
+    classDef store fill:#e5e7eb,color:#111827,stroke:#6b7280
+    classDef external fill:#f9fafb,color:#111827,stroke:#9ca3af
+
+    subgraph ENTRY["1. Entry"]
+        MAIN["main.py<br/>thin entrypoint"]
+        CLI["cli.py<br/>argparse + command handlers"]
+    end
+
+    subgraph COMMANDS["2. Command surface"]
+        CHECK["--check / --version"]
+        XINSPECT["excel inspect"]
+        INSPECT["inspect"]
+        SAFETYT["safety test"]
+        GROUNDCMD["ground"]
+        SETUPCMD["setup"]
+        CALCMD["calibrate"]
+        RUNCMD["run"]
+        RESUMECMD["resume"]
+        AGENTCMD["--agent / agent"]
+    end
+
+    subgraph AGENT["3. Agent orchestration"]
+        WIZARD["agent/wizard.py<br/>interactive onboarding"]
+        SETUPFLOW["agent/setup_flow.py<br/>print / edit / approve mapping"]
+        ORCH["agent/orchestrator.py<br/>RunSession + resume preflight"]
+        WORKSPACE["agent/workspace.py<br/>working-copy selection"]
+        RUNSTATE["agent/state_store.py<br/>atomic run-state JSON"]
+        CALIB["agent/calibration.py<br/>resolve layout, fill, read back,<br/>verify save, trust mapping"]
+        ROWRUN["agent/row_runner.py<br/>batch loop, per-row retry, RECHECK"]
+    end
+
+    subgraph AI["4. AI layer"]
+        AICLIENT["ai/client.py<br/>GeminiClient + retries + JSON + logging"]
+        PROMPTS["ai/prompts.py<br/>prompt loading + rendering"]
+        GROUNDING["ai/grounding.py<br/>schema validation + rect resolution"]
+        MAPPING["ai/mapping.py<br/>validate / approve / persist mapping"]
+        VERIFY["ai/verification.py<br/>pre-save and post-save checks"]
+    end
+
+    subgraph DESKTOP["5. Desktop layer"]
+        WINDOW["desktop/window.py<br/>find / focus / pin / geometry / DPI"]
+        CAPTURE["desktop/capture.py<br/>PrintWindow + screen-crop fallback"]
+        UIA["desktop/uia.py<br/>UIA inspection + read/invoke/focus"]
+        INPUT["desktop/input.py<br/>SendInput: click / type / paste<br/>AGENT_TAG tagging"]
+        COORDS["desktop/coordinates.py<br/>normalized box to screen rect"]
+    end
+
+    subgraph EXCEL["6. Excel layer"]
+        READER["excel/reader.py<br/>pandas read-only + pending rows"]
+        WRITER["excel/writer.py<br/>openpyxl copy + status writes"]
+    end
+
+    subgraph SAFETY["7. Safety layer"]
+        CONTROLLER["safety/controller.py<br/>IDLE / RUNNING / PAUSED / STOPPED"]
+        INPUTLOCK["safety/input_lock.py<br/>global low-level hooks"]
+        HOTKEYS["safety/hotkeys.py<br/>Alt+T / Alt+P / Alt+R"]
+        WATCHDOG["safety/watchdog.py<br/>120s no-heartbeat stop"]
+        OVERLAY["safety/overlay.py<br/>always-on-top status"]
+    end
+
+    subgraph FOUNDATION["8. Foundation"]
+        CFG["config.py<br/>typed config + env + paths"]
+        MODELS["models/screen.py<br/>Rect / WindowInfo / UIACandidate"]
+        MODELSVERIFY["models/verification.py<br/>pre/post-save schemas + verdicts"]
+        LOGGING["logging_setup.py<br/>logging + redaction"]
+        IMAGES["utils/images.py<br/>resize + annotation"]
+        RETRY["utils/retry.py"]
+        JSONUTIL["utils/json_utils.py"]
+    end
+
+    subgraph PERSIST["9. Persistence and artifacts"]
+        MAPFILE["data/state/mapping.json<br/>approved mapping + trusted flag"]
+        OUTFILE["data/state/output.json<br/>active working-copy pointer"]
+        STATEFILE["data/state/run_state.json<br/>pending / completed / stop info"]
+        SCREENSHOTS["data/screenshots/<br/>pre/post-save + preflight"]
+        AILOGS["data/ai_logs/<br/>prompt / response / error"]
+        SETUPART["data/setup/ and data/grounding/<br/>annotated PNG + grounding JSON"]
+        LOGS["data/logs/"]
+        DATADIRS["data/input/ + data/output/"]
+    end
+
+    subgraph EXT["10. External systems"]
+        TARGET["Target Windows application"]
+        GEMINI["Gemini API"]
+        SRCEXCEL["Source .xlsx<br/>read-only, never modified"]
+        WORKXLSX["Working-copy .xlsx<br/>receives DONE / RECHECK"]
+    end
+
+    %% Entry and command routing
+    MAIN --> CLI
+    CLI --> CHECK
+    CLI --> XINSPECT
+    CLI --> INSPECT
+    CLI --> SAFETYT
+    CLI --> GROUNDCMD
+    CLI --> SETUPCMD
+    CLI --> CALCMD
+    CLI --> RUNCMD
+    CLI --> RESUMECMD
+    CLI --> AGENTCMD
+
+    %% Foundation use
+    CLI --> CFG
+    CLI --> LOGGING
+    CHECK --> CFG
+    CHECK --> LOGS
+    INSPECT --> WINDOW
+    INSPECT --> CAPTURE
+    INSPECT --> UIA
+    XINSPECT --> READER
+    XINSPECT --> CFG
+    SAFETYT --> CONTROLLER
+    GROUNDCMD --> CAPTURE
+    GROUNDCMD --> UIA
+    GROUNDCMD --> GROUNDING
+    GROUNDCMD --> IMAGES
+
+    %% Wizard drives the real command handlers
+    AGENTCMD --> WIZARD
+    WIZARD --> SETUPCMD
+    WIZARD --> CALCMD
+    WIZARD --> RUNCMD
+    WIZARD --> WINDOW
+    WIZARD --> READER
+    WIZARD --> CFG
+
+    %% setup command
+    SETUPCMD --> CFG
+    SETUPCMD --> READER
+    SETUPCMD --> CAPTURE
+    SETUPCMD --> UIA
+    SETUPCMD --> GROUNDING
+    SETUPCMD --> MAPPING
+    SETUPCMD --> SETUPFLOW
+    SETUPCMD --> IMAGES
+    SETUPFLOW --> MAPPING
+
+    %% calibrate command
+    CALCMD --> CFG
+    CALCMD --> MAPPING
+    CALCMD --> WORKSPACE
+    CALCMD --> READER
+    CALCMD --> WRITER
+    CALCMD --> CALIB
+    CALCMD --> AICLIENT
+    CALCMD --> WINDOW
+    CALCMD --> CONTROLLER
+    CALIB --> WINDOW
+    CALIB --> CAPTURE
+    CALIB --> UIA
+    CALIB --> INPUT
+    CALIB --> VERIFY
+    CALIB --> MAPPING
+    CALIB --> WRITER
+    CALIB --> CONTROLLER
+
+    %% run / resume commands
+    RUNCMD --> CFG
+    RUNCMD --> MAPPING
+    RUNCMD --> WORKSPACE
+    RUNCMD --> READER
+    RUNCMD --> WRITER
+    RUNCMD --> ORCH
+    RUNCMD --> ROWRUN
+    RUNCMD --> AICLIENT
+    RUNCMD --> WINDOW
+    RUNCMD --> CONTROLLER
+    RUNCMD --> STATEFILE
+    RESUMECMD --> RUNCMD
+    RESUMECMD --> STATEFILE
+
+    %% orchestration
+    ORCH --> RUNSTATE
+    ORCH --> STATEFILE
+    ORCH --> ROWRUN
+    ORCH --> CALIB
+    ORCH --> WORKSPACE
+    ORCH --> WINDOW
+    ORCH --> CAPTURE
+    ORCH --> UIA
+    WORKSPACE --> WRITER
+    WORKSPACE --> OUTFILE
+    WORKSPACE --> SRCEXCEL
+    RUNSTATE --> STATEFILE
+
+    %% row runner reuses calibration primitives
+    ROWRUN --> CALIB
+    ROWRUN --> MAPPING
+    ROWRUN --> AICLIENT
+    ROWRUN --> VERIFY
+    ROWRUN --> WINDOW
+    ROWRUN --> CAPTURE
+    ROWRUN --> UIA
+    ROWRUN --> INPUT
+    ROWRUN --> WRITER
+    ROWRUN --> CONTROLLER
+
+    %% AI layer
+    GROUNDING --> AICLIENT
+    GROUNDING --> PROMPTS
+    GROUNDING --> COORDS
+    GROUNDING --> IMAGES
+    GROUNDING --> MODELS
+    MAPPING --> GROUNDING
+    MAPPING --> READER
+    VERIFY --> AICLIENT
+    VERIFY --> PROMPTS
+    VERIFY --> MODELSVERIFY
+    VERIFY --> MAPPING
+    AICLIENT --> GEMINI
+    AICLIENT --> AILOGS
+
+    %% desktop layer
+    WINDOW --> MODELS
+    WINDOW --> TARGET
+    CAPTURE --> WINDOW
+    CAPTURE --> TARGET
+    UIA --> MODELS
+    UIA --> TARGET
+    INPUT --> TARGET
+    COORDS --> MODELS
+
+    %% excel layer
+    READER --> CFG
+    READER --> SRCEXCEL
+    WRITER --> CFG
+    WRITER --> WORKXLSX
+
+    %% safety layer
+    CONTROLLER --> INPUTLOCK
+    CONTROLLER --> HOTKEYS
+    CONTROLLER --> WATCHDOG
+    CONTROLLER --> OVERLAY
+    INPUTLOCK --> HOTKEYS
+    INPUTLOCK --> INPUT
+    WATCHDOG --> CONTROLLER
+
+    %% persistence
+    SETUPFLOW --> MAPFILE
+    MAPPING --> MAPFILE
+    CALIB --> MAPFILE
+    CALIB --> SCREENSHOTS
+    ROWRUN --> SCREENSHOTS
+    ORCH --> SCREENSHOTS
+    SETUPCMD --> SETUPART
+    GROUNDCMD --> SETUPART
+
+    %% classes
+    class MAIN,CLI entry
+    class CHECK,XINSPECT,INSPECT,SAFETYT,GROUNDCMD,SETUPCMD,CALCMD,RUNCMD,RESUMECMD,AGENTCMD command
+    class WIZARD,SETUPFLOW,ORCH,WORKSPACE,RUNSTATE,CALIB,ROWRUN agent
+    class AICLIENT,PROMPTS,GROUNDING,MAPPING,VERIFY ai
+    class WINDOW,CAPTURE,UIA,INPUT,COORDS desktop
+    class READER,WRITER excel
+    class CONTROLLER,INPUTLOCK,HOTKEYS,WATCHDOG,OVERLAY safety
+    class CFG,MODELS,MODELSVERIFY,LOGGING,IMAGES,RETRY,JSONUTIL foundation
+    class MAPFILE,OUTFILE,STATEFILE,SCREENSHOTS,AILOGS,SETUPART,LOGS,DATADIRS store
+    class TARGET,GEMINI,SRCEXCEL,WORKXLSX external
+
+
+%% ---------------------------------------------------------------------
+%% 2. PACKAGE / IMPORT DEPENDENCY GRAPH
+%% ---------------------------------------------------------------------
+flowchart LR
+
+    subgraph P_CLI["cli"]
+        CLI2["cli.py"]
+    end
+
+    subgraph P_AGENT["agent"]
+        WIZ2["wizard.py"]
+        SETUP2["setup_flow.py"]
+        ORCH2["orchestrator.py"]
+        WS2["workspace.py"]
+        STORE2["state_store.py"]
+        CAL2["calibration.py"]
+        RR2["row_runner.py"]
+    end
+
+    subgraph P_AI["ai"]
+        CLIENT2["client.py"]
+        PROMPT2["prompts.py"]
+        GROUND2["grounding.py"]
+        MAP2["mapping.py"]
+        VER2["verification.py"]
+    end
+
+    subgraph P_DESK["desktop"]
+        WIN2["window.py"]
+        CAP2["capture.py"]
+        UIA2["uia.py"]
+        IN2["input.py"]
+        COORD2["coordinates.py"]
+    end
+
+    subgraph P_XL["excel"]
+        READ2["reader.py"]
+        WRITE2["writer.py"]
+    end
+
+    subgraph P_SAFE["safety"]
+        CTRL2["controller.py"]
+        LOCK2["input_lock.py"]
+        HOT2["hotkeys.py"]
+        WD2["watchdog.py"]
+        OV2["overlay.py"]
+    end
+
+    subgraph P_FOUND["foundation"]
+        CFG2["config.py"]
+        MOD2["models/screen.py"]
+        MODV2["models/verification.py"]
+        LOG2["logging_setup.py"]
+        IMG2["utils/images.py"]
+    end
+
+    CLI2 --> CFG2
+    CLI2 --> LOG2
+    CLI2 --> WIZ2
+    CLI2 --> ORCH2
+    CLI2 --> RR2
+    CLI2 --> CAL2
+
+    WIZ2 -. deferred import .-> CLI2
+    WIZ2 --> WIN2
+    WIZ2 --> READ2
+
+    SETUP2 --> MAP2
+    SETUP2 --> GROUND2
+
+    ORCH2 --> STORE2
+    ORCH2 --> WS2
+    ORCH2 --> RR2
+    ORCH2 --> CAL2
+    ORCH2 --> WIN2
+    ORCH2 --> CAP2
+    ORCH2 --> UIA2
+
+    WS2 --> WRITE2
+    CAL2 --> MAP2
+    CAL2 --> VER2
+    CAL2 --> WIN2
+    CAL2 --> CAP2
+    CAL2 --> UIA2
+    CAL2 --> IN2
+    CAL2 --> CTRL2
+
+    RR2 --> CAL2
+    RR2 --> MAP2
+    RR2 --> VER2
+    RR2 --> WIN2
+    RR2 --> CAP2
+    RR2 --> UIA2
+    RR2 --> IN2
+    RR2 --> CTRL2
+
+    GROUND2 --> CLIENT2
+    GROUND2 --> PROMPT2
+    GROUND2 --> COORD2
+    GROUND2 --> IMG2
+    GROUND2 --> CAP2
+    GROUND2 --> MOD2
+
+    MAP2 --> GROUND2
+    MAP2 --> READ2
+
+    VER2 --> CLIENT2
+    VER2 --> PROMPT2
+    VER2 --> MODV2
+    VER2 --> MAP2
+
+    WIN2 --> MOD2
+    CAP2 --> WIN2
+    UIA2 --> MOD2
+    COORD2 --> MOD2
+
+    READ2 --> CFG2
+    WRITE2 --> CFG2
+
+    CTRL2 --> LOCK2
+    CTRL2 --> HOT2
+    CTRL2 --> WD2
+    CTRL2 --> OV2
+    LOCK2 --> HOT2
+    LOCK2 --> IN2
+    WD2 --> CTRL2
+
+
+%% ---------------------------------------------------------------------
+%% 3. SAFETY STATE MACHINE (as implemented today)
+%% ---------------------------------------------------------------------
+stateDiagram-v2
+    [*] --> IDLE
+
+    IDLE --> RUNNING : start()<br/>install input hooks + overlay + watchdog
+    RUNNING --> PAUSED : Alt+P / pause()<br/>input lock -> passthrough
+    PAUSED --> RUNNING : Alt+R / resume()<br/>input lock -> blocking
+    RUNNING --> STOPPED : Alt+T / stop(reason)
+    PAUSED --> STOPPED : Alt+T / stop(reason)
+    RUNNING --> STOPPED : watchdog timeout<br/>no heartbeat for 120s
+    RUNNING --> STOPPED : exception / close()
+    PAUSED --> STOPPED : close()
+    STOPPED --> [*]
+
+    note right of RUNNING
+        check() beats the watchdog and returns True
+        wait() sleeps in <=100ms slices
+        fill_row() checks before every field
+    end note
+
+    note right of PAUSED
+        check() blocks the automation thread
+        stop hotkey still works via the hook
+        watchdog ignores PAUSED
+        pause state is NOT persisted
+        no pause timeout
+    end note
+
+    note right of STOPPED
+        input hooks removed
+        overlay shows STOPPED
+        run state is written by the caller
+    end note
+
+
+%% ---------------------------------------------------------------------
+%% 4. CORE DATA MODEL
+%% ---------------------------------------------------------------------
+classDiagram
+    class AgentConfig {
+        +AppConfig app
+        +ExcelConfig excel
+        +FieldConfig[] fields
+        +ActionsConfig actions
+        +GeminiConfig gemini
+        +SafetyConfig safety
+    }
+
+    class AppConfig {
+        +str title_contains
+        +str process_name
+        +bool require_foreground
+        +bool pin_window
+    }
+
+    class ExcelConfig {
+        +str input_path
+        +str output_path
+        +any sheet
+        +int header_row
+        +str id_column
+        +str status_column
+        +str timestamp_column
+        +str error_column
+        +str done_value
+        +str recheck_value
+        +str[] skip_statuses
+        +str empty_cell_policy
+        +str[] required_columns
+    }
+
+    class FieldConfig {
+        +str column
+        +str field
+        +str type
+    }
+
+    class ActionsConfig {
+        +str save_button
+        +str new_record_button
+        +float wait_after_save_seconds
+    }
+
+    class GeminiConfig {
+        +str model
+        +int max_image_dimension
+        +int timeout_seconds
+        +int max_retries
+        +int max_ai_calls
+        +float min_layout_confidence
+        +float min_mapping_confidence
+    }
+
+    class SafetyConfig {
+        +str stop_hotkey
+        +str pause_hotkey
+        +str resume_hotkey
+        +bool block_external_input
+        +int max_attempts
+        +float action_delay_seconds
+        +bool stop_on_failure
+    }
+
+    class ApprovedMapping {
+        +int version
+        +str approved_at
+        +str model
+        +str window_title
+        +str process_name
+        +int[] image_size
+        +float layout_confidence
+        +MappingEntry[] entries
+        +ButtonEntry[] buttons
+        +str[] unmapped_columns
+        +bool trusted
+        +str trusted_at
+    }
+
+    class MappingEntry {
+        +str column
+        +str field_id
+        +str label
+        +str type
+        +str uia_candidate_id
+        +int[] rect
+        +float confidence
+    }
+
+    class ButtonEntry {
+        +str button_id
+        +str label
+        +str role
+        +str uia_candidate_id
+        +int[] rect
+    }
+
+    class RunState {
+        +int version
+        +str run_id
+        +str config_path
+        +str mapping_path
+        +str mapping_approved_at
+        +str input_path
+        +str output_path
+        +str window_title
+        +str window_process
+        +int window_handle
+        +str layout_fingerprint
+        +int[] pending
+        +RunRow[] completed
+        +bool stopped
+        +int stopped_row
+        +str stop_reason
+        +str updated_at
+    }
+
+    class RunRow {
+        +int row_number
+        +str status
+        +int attempts
+        +str error
+    }
+
+    class WorkspaceState {
+        +str input_path
+        +str output_path
+        +str updated_at
+    }
+
+    class WindowInfo {
+        +int handle
+        +str title
+        +str process_name
+        +str class_name
+        +Rect rect
+        +Rect client_rect
+        +int dpi
+    }
+
+    class Rect {
+        +int left
+        +int top
+        +int right
+        +int bottom
+        +width()
+        +height()
+        +bbox()
+        +center()
+    }
+
+    class UIACandidate {
+        +str candidate_id
+        +str name
+        +str control_type
+        +str automation_id
+        +str class_name
+        +Rect rect
+        +str value
+        +bool enabled
+    }
+
+    class Workbook {
+        +Path path
+        +str sheet_name
+        +str[] headers
+        +ExcelRow[] rows
+    }
+
+    class ExcelRow {
+        +int row_number
+        +dict values
+        +str status
+        +is_blank()
+    }
+
+    AgentConfig *-- AppConfig
+    AgentConfig *-- ExcelConfig
+    AgentConfig *-- ActionsConfig
+    AgentConfig *-- GeminiConfig
+    AgentConfig *-- SafetyConfig
+    AgentConfig *-- FieldConfig
+
+    ApprovedMapping *-- MappingEntry
+    ApprovedMapping *-- ButtonEntry
+
+    RunState *-- RunRow
+
+    WindowInfo *-- Rect
+    UIACandidate *-- Rect
+
+    Workbook *-- ExcelRow

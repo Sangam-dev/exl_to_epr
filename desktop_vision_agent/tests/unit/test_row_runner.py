@@ -298,7 +298,7 @@ def test_run_row_marks_done_without_asking_gemini(monkeypatch, tmp_path: Path) -
     assert calls == {"save": 1, "post": 0, "capture": 2}
 
 
-def test_run_row_retries_when_the_fields_are_unchanged(
+def test_run_row_does_not_save_again_when_the_fields_are_unchanged(
     monkeypatch, tmp_path: Path
 ) -> None:
     calls = _stub_desktop(
@@ -322,10 +322,11 @@ def test_run_row_retries_when_the_fields_are_unchanged(
     )
 
     assert result.status == "RECHECK"
-    assert result.attempts == 2
-    assert calls["save"] == 2
+    assert result.attempts == 1
+    assert calls["save"] == 1
     assert calls["post"] == 0
     assert "unchanged" in writer.calls[0][2]
+    assert "may already exist" in writer.calls[0][2]
     assert result.screenshots
 
 
@@ -615,6 +616,9 @@ def test_run_rows_stops_after_a_recheck_when_configured(monkeypatch) -> None:
 
     assert seen == [2]
     assert result.processed == 1
+    assert result.stopped
+    assert result.stopped_row == 2
+    assert "stop_on_failure" in result.stop_reason
 
 
 def test_run_rows_reports_an_aborted_row(monkeypatch) -> None:

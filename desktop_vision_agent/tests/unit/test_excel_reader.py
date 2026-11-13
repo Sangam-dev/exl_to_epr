@@ -76,7 +76,7 @@ def test_read_workbook_keeps_excel_row_numbers(tmp_path: Path) -> None:
     assert workbook.rows[1].is_blank()
 
 
-def test_pending_rows_skips_done_and_blank(tmp_path: Path) -> None:
+def test_pending_rows_skips_done_recheck_and_blank(tmp_path: Path) -> None:
     source = _make_workbook(
         tmp_path / "book.xlsx",
         ["ID", "Name", "Agent Status"],
@@ -90,7 +90,23 @@ def test_pending_rows_skips_done_and_blank(tmp_path: Path) -> None:
     config = _config(source, tmp_path)
     workbook = read_workbook(config)
 
-    assert [row.row_number for row in pending_rows(workbook, config)] == [2, 5]
+    assert [row.row_number for row in pending_rows(workbook, config)] == [2]
+
+
+def test_pending_rows_can_opt_back_into_recheck(tmp_path: Path) -> None:
+    source = _make_workbook(
+        tmp_path / "book.xlsx",
+        ["ID", "Name", "Agent Status"],
+        [
+            [1, "Acme", ""],
+            [2, "Beta", "DONE"],
+            [3, "Cedar", "RECHECK"],
+        ],
+    )
+    config = _config(source, tmp_path, skip_statuses=["DONE"])
+    workbook = read_workbook(config)
+
+    assert [row.row_number for row in pending_rows(workbook, config)] == [2, 4]
 
 
 def test_header_row_can_be_below_the_first_line(tmp_path: Path) -> None:

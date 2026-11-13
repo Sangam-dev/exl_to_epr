@@ -1,0 +1,151 @@
+%% =====================================================================
+%% Excel Desktop Agent - ARCHITECTURAL BLOCK DIAGRAM (V1)
+%%
+%% A. Runtime blocks: what talks to what while a row is processed
+%% B. End-to-end blocks: setup -> batch -> resume
+%% =====================================================================
+
+
+%% ---------------------------------------------------------------------
+%% A. RUNTIME BLOCK DIAGRAM
+%% ---------------------------------------------------------------------
+flowchart TB
+
+    classDef input fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+    classDef control fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+    classDef perceive fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef act fill:#fef3c7,stroke:#d97706,color:#78350f
+    classDef verify fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+    classDef data fill:#f3f4f6,stroke:#6b7280,color:#111827
+    classDef ext fill:#fce7f3,stroke:#db2777,color:#831843
+
+    subgraph IN["INPUTS"]
+        XLS["Excel workbook<br/>read-only"]:::input
+        CFG["Agent config"]:::input
+        MAP["Approved mapping"]:::input
+    end
+
+    subgraph CTRL["CONTROL PLANE"]
+        ORCH["Orchestrator<br/>row loop + run state"]:::control
+        SAFE["Safety controller<br/>stop / pause / resume"]:::control
+    end
+
+    subgraph PER["PERCEPTION"]
+        WIN["Window locator<br/>find / focus / pin"]:::perceive
+        UIA["UI inspector<br/>UIA tree + values"]:::perceive
+        SHOT["Screen capture"]:::perceive
+        RES["Layout resolver<br/>UIA first, saved rects fallback"]:::perceive
+    end
+
+    subgraph ACT["ACTION"]
+        FILL["Field filler<br/>click / select / paste"]:::act
+        SAVE["Save clicker"]:::act
+    end
+
+    subgraph VER["VERIFICATION"]
+        RB["UIA read-back"]:::verify
+        DIFF["Before/after<br/>pixel diff"]:::verify
+        AICHK["Gemini save check<br/>ambiguous only"]:::verify
+        VERDICT["Row verdict<br/>DONE / RECHECK"]:::verify
+    end
+
+    subgraph OUT["OUTPUTS"]
+        WORK[("Working-copy workbook<br/>DONE / RECHECK")]:::data
+        STATE[("Run state")]:::data
+        ART[("Screenshots + logs")]:::data
+    end
+
+    TARGET["Target desktop app"]:::ext
+    GEMINI["Gemini API"]:::ext
+
+    XLS --> ORCH
+    CFG --> ORCH
+    MAP --> RES
+
+    ORCH <--> STATE
+    ORCH --> WIN
+    WIN --> UIA
+    UIA --> RES
+    TARGET --> SHOT
+
+    RES --> FILL
+    ORCH --> FILL
+    FILL --> TARGET
+    ORCH --> SAVE
+    SAVE --> TARGET
+
+    UIA --> RB
+    FILL --> RB
+    SHOT --> DIFF
+    RB --> VERDICT
+    DIFF --> VERDICT
+    VERDICT -->|ambiguous| AICHK
+    AICHK --> VERDICT
+    GEMINI <--> AICHK
+
+    VERDICT -->|verified| WORK
+    VERDICT -->|uncertain| WORK
+    VERDICT --> ORCH
+    ORCH --> ART
+
+    SAFE -.-> ORCH
+    SAFE -.-> FILL
+    SAFE -.-> SAVE
+
+
+%% ---------------------------------------------------------------------
+%% B. END-TO-END OPERATING BLOCKS
+%% ---------------------------------------------------------------------
+flowchart LR
+
+    classDef setup fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+    classDef run fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef check fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+    classDef warn fill:#fef3c7,stroke:#d97706,color:#78350f
+    classDef stop fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+
+    subgraph S1["1. SETUP - once per app and workbook"]
+        direction TB
+        A1["Read workbook headers"]:::setup
+        A2["Find and inspect<br/>target window"]:::setup
+        A3["Gemini grounding"]:::setup
+        A4["Validate mapping<br/>human approves"]:::setup
+        A5["Calibrate first<br/>pending row"]:::setup
+        A6["Mark mapping trusted"]:::setup
+        A1 --> A2 --> A3 --> A4 --> A5 --> A6
+    end
+
+    subgraph S2["2. BATCH - automatic, no AI on the happy path"]
+        direction TB
+        B1["Read next<br/>pending row"]:::run
+        B2["Resolve live layout<br/>UIA or saved rects"]:::run
+        B3["Fill fields<br/>and read back"]:::run
+        B4["Click Save once"]:::run
+        B5["Verify save<br/>read-back + pixel diff"]:::check
+        B6{"Verified?"}:::check
+        B7["Write DONE"]:::run
+        B8["Write RECHECK<br/>never re-click Save"]:::warn
+        B9{"More rows?"}:::run
+        B10["Safe stop<br/>or continue"]:::stop
+        B11["Batch summary"]:::run
+        B1 --> B2 --> B3 --> B4 --> B5 --> B6
+        B6 -->|yes| B7
+        B6 -->|no or uncertain| B8
+        B7 --> B9
+        B8 --> B10
+        B9 -->|yes| B1
+        B9 -->|no| B11
+    end
+
+    subgraph S3["3. RESUME - after stop or crash"]
+        direction TB
+        C1["Load run state"]:::warn
+        C2["Revalidate window<br/>and layout"]:::warn
+        C3["Skip finished<br/>or status rows"]:::warn
+        C4["Continue batch"]:::warn
+        C1 --> C2 --> C3 --> C4
+    end
+
+    A6 --> B1
+    B10 --> C1
+    C4 --> B1

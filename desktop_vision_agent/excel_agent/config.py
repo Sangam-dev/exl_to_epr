@@ -42,6 +42,7 @@ class AppConfig(BaseModel):
     title_contains: str = ""
     process_name: str | None = None
     require_foreground: bool = True
+    pin_window: bool = True
 
     @model_validator(mode="after")
     def _must_have_matcher(self) -> "AppConfig":
@@ -65,7 +66,9 @@ class ExcelConfig(BaseModel):
     error_column: str = "Agent Error"
     done_value: str = "DONE"
     recheck_value: str = "RECHECK"
-    skip_statuses: list[str] = Field(default_factory=lambda: ["DONE"])
+    skip_statuses: list[str] = Field(
+        default_factory=lambda: ["DONE", "RECHECK"]
+    )
     empty_cell_policy: EmptyCellPolicy = "skip"
     required_columns: list[str] = Field(default_factory=list)
 
