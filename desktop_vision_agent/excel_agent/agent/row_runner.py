@@ -2,11 +2,11 @@
 
 Calibration proves the map on the first row. The runner then processes every
 pending row with the same deterministic path: resolve the live controls, fill,
-read back, Save, and compare the filled fields before and after Save.
+read back, Save, and confirm the save from configured text evidence.
 
-Gemini is consulted only when the pixel comparison cannot decide (no comparable
-field, a window-size change, or a form that keeps its values). A clean row costs
-no AI call.
+A Save is never retried once clicked. Retries only cover failures that happen
+before the click (fill/read-back problems). Save confirmation is pluggable and
+explicit: only ``CONFIRMED`` becomes ``DONE``; everything else is ``RECHECK``.
 """
 
 from __future__ import annotations
@@ -18,18 +18,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Sequence
 
-from ..ai.client import GeminiClient, GeminiError
+from ..ai.client import GeminiClient
 from ..ai.mapping import ApprovedMapping
-from ..ai.verification import check_post_save
 from ..config import AgentConfig, project_root
 from ..desktop.capture import Capture, CaptureError, capture_window
 from ..desktop.input import InputError, click
 from ..desktop.uia import UIAError, inspect_window
 from ..desktop.window import WindowError, attach_window
 from ..excel.reader import ExcelRow, format_value
-from ..excel.writer import ExcelWriteError, WorkbookWriter
+from ..excel.writer import WorkbookWriter
 from ..models.screen import Rect, WindowInfo
-from ..models.verification import VerificationError
 from ..safety.controller import SafetyController
 from .calibration import (
     CalibrationAborted,
@@ -41,12 +39,22 @@ from .calibration import (
     read_back,
     resolve_layout,
 )
+from .confirmation import (
+    CONFIRMED,
+    REJECTED,
+    ConfirmationError,
+    GeminiTextReader,
+    SaveConfirmer,
+    TextConfirmation,
+)
+from .pending_status import (
+    DEFAULT_PENDING_STATUS,
+    PendingStatusError,
+    queue_pending_status,
+    write_status_with_retries,
+)
 
 logger = logging.getLogger(__name__)
-
-SAVED = "saved"
-NOT_SAVED = "not_saved"
-AMBIGUOUS = "ambiguous"
 
 LayoutObserver = Callable[[ResolvedLayout, WindowInfo], None]
 
@@ -68,6 +76,7 @@ class RowOutcome:
     attempts: int
     error: str = ""
     screenshots: tuple[Path, ...] = ()
+    status_written: bool = True
 
 
 @dataclass(frozen=True)
@@ -99,13 +108,6 @@ def layout_fingerprint(
         ),
         layout.save.rect.bbox if layout.save is not None else None,
     )
-
-
-def classify_save(evidence: SaveEvidence) -> str:
-    """Turn the pixel comparison into a save verdict."""
-    if not evidence.compared:
-        return AMBIGUOUS
-    return NOT_SAVED if evidence.unchanged else SAVED
 
 
 def _running(controller: SafetyController | None) -> bool:
@@ -149,28 +151,19 @@ def _screenshot(
     return path
 
 
-def _heartbeat(
-    controller: SafetyController | None,
-) -> Callable[[int], None]:
-    def beat(_attempt: int) -> None:
-        if controller is not None:
-            controller.check()
-
-    return beat
-
-
-def _write_status(
-    writer: WorkbookWriter,
+def _ask_before_save(
     row: ExcelRow,
-    status: str,
-    error: str = "",
+    input_func: Callable[[str], str],
 ) -> None:
-    try:
-        writer.write_status(row.row_number, status, error=error)
-    except ExcelWriteError as exc:
-        raise RunnerError(
-            f"could not write {status!r} for row {row.row_number}: {exc}"
-        ) from exc
+    answer = input_func(
+        f"Row {row.row_number}: press Enter or Y to click Save "
+        "(anything else stops): "
+    )
+    if answer.strip().casefold() not in ("", "y", "yes"):
+        raise RunnerAborted(
+            f"Save declined by the user for row {row.row_number}; the row "
+            "was not saved"
+        )
 
 
 def _finish(
@@ -182,18 +175,63 @@ def _finish(
     attempts: int,
     screenshots: Sequence[Path],
     output: Callable[[str], None],
+    pending_status_path: str | Path | None = None,
+    status_attempts: int = 3,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> RowOutcome:
-    _write_status(writer, row, status, error)
-    message = f"Row {row.row_number}: {status}"
-    if error:
-        message += f" - {error}"
-    output(message)
+    ok, failure = write_status_with_retries(
+        writer.write_status,
+        row.row_number,
+        status,
+        error,
+        attempts=status_attempts,
+        sleep=sleep,
+    )
+    if ok:
+        message = f"Row {row.row_number}: {status}"
+        if error:
+            message += f" - {error}"
+        output(message)
+        return RowOutcome(
+            row_number=row.row_number,
+            status=status,
+            attempts=attempts,
+            error=error,
+            screenshots=tuple(screenshots),
+        )
+
+    sidecar = (
+        Path(pending_status_path)
+        if pending_status_path is not None
+        else DEFAULT_PENDING_STATUS
+    )
+    sidecar_problem = ""
+    try:
+        queue_pending_status(
+            row_number=row.row_number,
+            status=status,
+            error=error,
+            path=sidecar,
+        )
+    except PendingStatusError as exc:
+        sidecar_problem = (
+            f"; the pending-status sidecar could not be written: {exc}"
+        )
+
+    note = (
+        f"status {status!r} could not be written after "
+        f"{status_attempts} attempt(s): {failure}; queued in {sidecar}"
+        f"{sidecar_problem}"
+    )
+    combined = f"{error} | {note}" if error else note
+    output(f"Row {row.row_number}: {status} - {note}")
     return RowOutcome(
         row_number=row.row_number,
         status=status,
         attempts=attempts,
-        error=error,
+        error=combined,
         screenshots=tuple(screenshots),
+        status_written=False,
     )
 
 
@@ -205,15 +243,53 @@ def run_row(
     writer: WorkbookWriter,
     client: GeminiClient,
     controller: SafetyController | None = None,
+    confirmation: SaveConfirmer | None = None,
+    on_before_save: Callable[[ExcelRow], None] | None = None,
+    confirm_each: bool = False,
+    input_func: Callable[[str], str] | None = None,
     screenshot_dir: str | Path | None = None,
     on_layout: LayoutObserver | None = None,
+    pending_status_path: str | Path | None = None,
+    status_attempts: int = 3,
+    sleep: Callable[[float], None] = time.sleep,
     output: Callable[[str], None] = print,
 ) -> RowOutcome:
-    """Fill, save, and verify one row."""
+    """Fill, save, and confirm one row.
+
+    Once Save is clicked the row is never saved again in this run, whatever
+    the confirmation outcome. Only ``CONFIRMED`` becomes ``DONE``.
+    """
     if not mapping.entries:
         raise RunnerError("the approved mapping has no column -> field entries")
     if mapping.button_for_role("save") is None:
         raise RunnerError("the approved mapping has no Save button")
+
+    if confirmation is None:
+        confirmation = TextConfirmation(
+            config.confirmation, GeminiTextReader(client)
+        )
+    if input_func is None:
+        input_func = input
+
+    def finish(
+        status: str,
+        *,
+        error: str,
+        attempts: int,
+        screenshots: Sequence[Path],
+    ) -> RowOutcome:
+        return _finish(
+            writer,
+            row,
+            status,
+            error=error,
+            attempts=attempts,
+            screenshots=screenshots,
+            output=output,
+            pending_status_path=pending_status_path,
+            status_attempts=status_attempts,
+            sleep=sleep,
+        )
 
     try:
         values = {
@@ -223,14 +299,11 @@ def run_row(
             for entry in mapping.entries
         }
     except ValueError as exc:
-        return _finish(
-            writer,
-            row,
+        return finish(
             config.excel.recheck_value,
             error=f"row {row.row_number} has an invalid value: {exc}",
             attempts=0,
             screenshots=(),
-            output=output,
         )
 
     directory = (
@@ -302,105 +375,60 @@ def run_row(
             _require_running(
                 controller, "stopped before Save; the row was not saved"
             )
+
+            if confirm_each:
+                _ask_before_save(row, input_func)
+            if on_before_save is not None:
+                on_before_save(row)
             _click_save(layout)
             saved = True
 
             if not _wait(controller, config.actions.wait_after_save_seconds):
                 persist(pre, "pre_save")
-                return _finish(
-                    writer,
-                    row,
+                return finish(
                     config.excel.recheck_value,
                     error="stopped after Save; the record may already exist",
                     attempts=attempt,
                     screenshots=screenshots,
-                    output=output,
                 )
 
             post = capture_window(window)
             evidence = compare_saved_fields(pre, post, layout, values)
-            kind = classify_save(evidence)
-            output(f"  save check: {kind} ({evidence.detail})")
+            output(f"  save hint: {evidence.detail}")
+            result = confirmation.confirm(
+                post.image, weak_hint=evidence.detail
+            )
+            output(
+                f"  save confirmation: {result.outcome} ({result.reason})"
+            )
 
-            if kind == SAVED:
-                return _finish(
-                    writer,
-                    row,
+            if result.outcome == CONFIRMED:
+                return finish(
                     config.excel.done_value,
                     error="",
                     attempts=attempt,
                     screenshots=screenshots,
-                    output=output,
                 )
 
             persist(pre, "pre_save")
             persist(post, "post_save")
-
-            if kind == NOT_SAVED:
+            if result.outcome == REJECTED:
                 message = (
-                    "the filled fields are unchanged after Save; the record "
-                    "may already exist, so the row was not saved again"
+                    f"save rejected: {result.reason}; the record may already "
+                    "exist, so the row was not saved again"
                 )
-                issues.append(f"attempt {attempt}: {message}")
-                output(f"  save not detected: {message}")
-                return _finish(
-                    writer,
-                    row,
-                    config.excel.recheck_value,
-                    error=message,
-                    attempts=attempt,
-                    screenshots=screenshots,
-                    output=output,
+            else:
+                message = (
+                    "record may already exist: "
+                    f"{result.reason or 'the save could not be confirmed'}"
                 )
-
-            verdict = check_post_save(
-                client,
-                pre,
-                post,
-                mapping.entries,
-                values,
-                config.gemini,
-                on_attempt=_heartbeat(controller),
-            )
-            if not _running(controller):
-                return _finish(
-                    writer,
-                    row,
-                    config.excel.recheck_value,
-                    error=(
-                        "stopped during post-save verification; the record "
-                        "may already exist"
-                    ),
-                    attempts=attempt,
-                    screenshots=screenshots,
-                    output=output,
-                )
-
-            if verdict.approved and not evidence.unchanged:
-                return _finish(
-                    writer,
-                    row,
-                    config.excel.done_value,
-                    error="",
-                    attempts=attempt,
-                    screenshots=screenshots,
-                    output=output,
-                )
-
-            message = "; ".join(verdict.issues) or (
-                "the save evidence is ambiguous"
-            )
-            return _finish(
-                writer,
-                row,
+            issues.append(f"attempt {attempt}: {message}")
+            output(f"  save not confirmed: {message}")
+            return finish(
                 config.excel.recheck_value,
-                error=(
-                    "post-save check uncertain; the record may already exist: "
-                    f"{message}"
-                ),
+                error=message,
                 attempts=attempt,
                 screenshots=screenshots,
-                output=output,
             )
 
         except CalibrationAborted as exc:
@@ -410,8 +438,7 @@ def run_row(
         except RunnerError:
             raise
         except (
-            GeminiError,
-            VerificationError,
+            ConfirmationError,
             UIAError,
             CaptureError,
             InputError,
@@ -420,9 +447,7 @@ def run_row(
             if saved:
                 persist(pre, "pre_save")
                 persist(post, "post_save")
-                return _finish(
-                    writer,
-                    row,
+                return finish(
                     config.excel.recheck_value,
                     error=(
                         "post-save verification failed after Save; the record "
@@ -430,7 +455,6 @@ def run_row(
                     ),
                     attempts=attempt,
                     screenshots=screenshots,
-                    output=output,
                 )
             issues.append(f"attempt {attempt}: {exc}")
             output(f"  attempt failed: {exc}")
@@ -440,14 +464,11 @@ def run_row(
         f"row failed after {attempts} attempt(s): "
         + " | ".join(issues[-4:])
     )
-    return _finish(
-        writer,
-        row,
+    return finish(
         config.excel.recheck_value,
         error=error,
         attempts=attempts,
         screenshots=screenshots,
-        output=output,
     )
 
 
@@ -459,7 +480,14 @@ def run_rows(
     writer: WorkbookWriter,
     client: GeminiClient,
     controller: SafetyController | None = None,
+    confirmation: SaveConfirmer | None = None,
+    on_before_save: Callable[[ExcelRow], None] | None = None,
+    confirm_each: bool = False,
+    input_func: Callable[[str], str] | None = None,
     screenshot_dir: str | Path | None = None,
+    pending_status_path: str | Path | None = None,
+    status_attempts: int = 3,
+    sleep: Callable[[float], None] = time.sleep,
     limit: int | None = None,
     on_row: Callable[[RowOutcome], None] | None = None,
     on_layout: LayoutObserver | None = None,
@@ -519,7 +547,14 @@ def run_rows(
                 writer=writer,
                 client=client,
                 controller=controller,
+                confirmation=confirmation,
+                on_before_save=on_before_save,
+                confirm_each=confirm_each,
+                input_func=input_func,
                 screenshot_dir=screenshot_dir,
+                pending_status_path=pending_status_path,
+                status_attempts=status_attempts,
+                sleep=sleep,
                 on_layout=observe,
                 output=output,
             )
@@ -533,6 +568,21 @@ def run_rows(
         outcomes.append(outcome)
         if on_row is not None:
             on_row(outcome)
+        if not outcome.status_written:
+            stopped = True
+            stopped_row = row.row_number
+            sidecar = (
+                Path(pending_status_path)
+                if pending_status_path is not None
+                else DEFAULT_PENDING_STATUS
+            )
+            stop_reason = (
+                f"row {row.row_number} finished as {outcome.status} but its "
+                f"status could not be written; queued in {sidecar}. Fix "
+                "workbook access and resume before processing more rows"
+            )
+            output(f"Stopping: {stop_reason}")
+            break
         if (
             outcome.status != config.excel.done_value
             and config.safety.stop_on_failure
@@ -555,14 +605,10 @@ def run_rows(
 
 
 __all__ = [
-    "AMBIGUOUS",
-    "NOT_SAVED",
-    "SAVED",
     "RowOutcome",
     "RunResult",
     "RunnerAborted",
     "RunnerError",
-    "classify_save",
     "layout_fingerprint",
     "run_row",
     "run_rows",

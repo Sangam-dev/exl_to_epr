@@ -9,14 +9,17 @@ from PIL import Image
 
 from excel_agent.agent import row_runner
 from excel_agent.agent.calibration import ResolvedLayout, ResolvedTarget, SaveEvidence
+from excel_agent.agent.confirmation import (
+    CONFIRMED,
+    REJECTED,
+    UNKNOWN,
+    ConfirmationResult,
+)
+from excel_agent.agent.pending_status import PendingStatusFile, load_pending_status
 from excel_agent.agent.row_runner import (
-    AMBIGUOUS,
-    NOT_SAVED,
-    SAVED,
     RowOutcome,
     RunnerAborted,
     RunnerError,
-    classify_save,
     layout_fingerprint,
     run_row,
     run_rows,
@@ -27,7 +30,6 @@ from excel_agent.desktop.capture import Capture
 from excel_agent.desktop.uia import UIAInspection
 from excel_agent.excel.reader import ExcelRow
 from excel_agent.models.screen import Rect, WindowInfo
-from excel_agent.models.verification import PostSaveResponse, PostSaveVerdict
 
 
 def _window(width: int = 400, height: int = 300) -> WindowInfo:
@@ -132,39 +134,59 @@ def _capture(width: int = 400, height: int = 300) -> Capture:
     )
 
 
-def _post_verdict(
-    approved: bool, saved: bool, issues: tuple[str, ...] = ()
-) -> PostSaveVerdict:
-    return PostSaveVerdict(
-        approved=approved,
-        saved=saved,
-        response=PostSaveResponse(approved=approved, saved=saved),
-        issues=issues,
-    )
-
-
 class FakeWriter:
-    def __init__(self) -> None:
+    def __init__(self, failures: int = 0) -> None:
+        self.failures = failures
         self.calls: list[tuple[int, str, str]] = []
 
     def write_status(
         self, row_number: int, status: str, error: str = "", timestamp=None
     ) -> None:
+        if self.failures > 0:
+            self.failures -= 1
+            raise OSError("the workbook is open in Excel")
         self.calls.append((row_number, status, error))
+
+
+class FakeConfirmer:
+    def __init__(
+        self, result: ConfirmationResult, on_confirm=None
+    ) -> None:
+        self.result = result
+        self.on_confirm = on_confirm
+        self.images: list[object] = []
+        self.weak_hints: list[str] = []
+
+    def confirm(self, image, *, weak_hint: str = "") -> ConfirmationResult:
+        self.images.append(image)
+        self.weak_hints.append(weak_hint)
+        if self.on_confirm is not None:
+            self.on_confirm()
+        return self.result
+
+
+def _confirmation(
+    outcome: str = CONFIRMED, reason: str = "", evidence: tuple[str, ...] = ()
+) -> ConfirmationResult:
+    return ConfirmationResult(
+        outcome=outcome,
+        reason=reason,
+        evidence=evidence,
+        source="fake",
+    )
 
 
 def _stub_desktop(
     monkeypatch,
     *,
     evidence: SaveEvidence,
-    post_verdict: PostSaveVerdict | None = None,
     stub_wait: bool = True,
     on_save=None,
 ) -> dict[str, int]:
     window = _window()
     inspection = _inspection()
     captures = [_capture(), _capture()]
-    calls = {"save": 0, "post": 0, "capture": 0}
+    calls = {"save": 0, "capture": 0}
 
     def fake_capture(_window):
         index = min(calls["capture"], len(captures) - 1)
@@ -175,10 +197,6 @@ def _stub_desktop(
         calls["save"] += 1
         if on_save is not None:
             on_save()
-
-    def fake_post(*_args, **_kwargs):
-        calls["post"] += 1
-        return post_verdict or _post_verdict(True, True)
 
     monkeypatch.setattr(row_runner, "attach_window", lambda _app: window)
     monkeypatch.setattr(row_runner, "inspect_window", lambda _window: inspection)
@@ -191,29 +209,12 @@ def _stub_desktop(
     monkeypatch.setattr(
         row_runner, "compare_saved_fields", lambda *a, **k: evidence
     )
-    monkeypatch.setattr(row_runner, "check_post_save", fake_post)
     return calls
 
 
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
-
-
-def test_classify_save() -> None:
-    assert (
-        classify_save(
-            SaveEvidence(unchanged=False, compared=("Invoice Number",))
-        )
-        == SAVED
-    )
-    assert (
-        classify_save(
-            SaveEvidence(unchanged=True, compared=("Invoice Number",))
-        )
-        == NOT_SAVED
-    )
-    assert classify_save(SaveEvidence(unchanged=False, compared=())) == AMBIGUOUS
 
 
 def test_layout_fingerprint_tracks_geometry_not_candidate_ids() -> None:
@@ -271,7 +272,7 @@ def test_layout_fingerprint_tracks_geometry_not_candidate_ids() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_run_row_marks_done_without_asking_gemini(monkeypatch, tmp_path: Path) -> None:
+def test_run_row_confirmed_marks_done(monkeypatch, tmp_path: Path) -> None:
     calls = _stub_desktop(
         monkeypatch,
         evidence=SaveEvidence(
@@ -281,6 +282,7 @@ def test_run_row_marks_done_without_asking_gemini(monkeypatch, tmp_path: Path) -
         ),
     )
     writer = FakeWriter()
+    confirmer = FakeConfirmer(_confirmation(CONFIRMED, "success text matched"))
 
     result = run_row(
         _row(),
@@ -288,6 +290,7 @@ def test_run_row_marks_done_without_asking_gemini(monkeypatch, tmp_path: Path) -
         mapping=_mapping(),
         writer=writer,
         client=object(),
+        confirmation=confirmer,
         screenshot_dir=tmp_path / "shots",
     )
 
@@ -295,7 +298,68 @@ def test_run_row_marks_done_without_asking_gemini(monkeypatch, tmp_path: Path) -
     assert result.attempts == 1
     assert result.screenshots == ()
     assert writer.calls == [(2, "DONE", "")]
-    assert calls == {"save": 1, "post": 0, "capture": 2}
+    assert calls == {"save": 1, "capture": 2}
+    assert len(confirmer.images) == 1
+    assert confirmer.weak_hints == ["the filled fields changed"]
+
+
+def test_run_row_confirmed_wins_even_when_the_fields_are_unchanged(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _stub_desktop(
+        monkeypatch,
+        evidence=SaveEvidence(
+            unchanged=True,
+            compared=("Invoice Number",),
+            identical=("Invoice Number",),
+            detail="the filled fields are unchanged",
+        ),
+    )
+    writer = FakeWriter()
+    confirmer = FakeConfirmer(_confirmation(CONFIRMED, "saved banner"))
+
+    result = run_row(
+        _row(),
+        config=_config(),
+        mapping=_mapping(),
+        writer=writer,
+        client=object(),
+        confirmation=confirmer,
+        screenshot_dir=tmp_path / "shots",
+    )
+
+    assert result.status == "DONE"
+    assert writer.calls == [(2, "DONE", "")]
+
+
+def test_pixel_change_alone_is_never_done(monkeypatch, tmp_path: Path) -> None:
+    calls = _stub_desktop(
+        monkeypatch,
+        evidence=SaveEvidence(
+            unchanged=False,
+            compared=("Invoice Number",),
+            detail="the filled fields changed",
+        ),
+    )
+    writer = FakeWriter()
+    confirmer = FakeConfirmer(_confirmation(UNKNOWN, "no success text"))
+
+    result = run_row(
+        _row(),
+        config=_config(max_attempts=3),
+        mapping=_mapping(),
+        writer=writer,
+        client=object(),
+        confirmation=confirmer,
+        screenshot_dir=tmp_path / "shots",
+    )
+
+    assert result.status == "RECHECK"
+    assert result.attempts == 1
+    assert calls["save"] == 1
+    assert "record may already exist" in result.error
+    assert writer.calls[0][1] == "RECHECK"
+    assert confirmer.weak_hints == ["the filled fields changed"]
 
 
 def test_run_row_does_not_save_again_when_the_fields_are_unchanged(
@@ -311,6 +375,7 @@ def test_run_row_does_not_save_again_when_the_fields_are_unchanged(
         ),
     )
     writer = FakeWriter()
+    confirmer = FakeConfirmer(_confirmation(UNKNOWN, "no success text"))
 
     result = run_row(
         _row(),
@@ -318,48 +383,18 @@ def test_run_row_does_not_save_again_when_the_fields_are_unchanged(
         mapping=_mapping(),
         writer=writer,
         client=object(),
+        confirmation=confirmer,
         screenshot_dir=tmp_path / "shots",
     )
 
     assert result.status == "RECHECK"
     assert result.attempts == 1
     assert calls["save"] == 1
-    assert calls["post"] == 0
-    assert "unchanged" in writer.calls[0][2]
     assert "may already exist" in writer.calls[0][2]
     assert result.screenshots
 
 
-def test_run_row_asks_gemini_when_the_diff_is_ambiguous(
-    monkeypatch, tmp_path: Path
-) -> None:
-    calls = _stub_desktop(
-        monkeypatch,
-        evidence=SaveEvidence(
-            unchanged=False,
-            compared=(),
-            detail="no non-empty field could be compared",
-        ),
-        post_verdict=_post_verdict(True, True),
-    )
-    writer = FakeWriter()
-
-    result = run_row(
-        _row(),
-        config=_config(),
-        mapping=_mapping(),
-        writer=writer,
-        client=object(),
-        screenshot_dir=tmp_path / "shots",
-    )
-
-    assert result.status == "DONE"
-    assert result.attempts == 1
-    assert calls["post"] == 1
-    assert calls["save"] == 1
-
-
-def test_run_row_does_not_retry_an_ambiguous_save_gemini_rejects(
+def test_run_row_rejects_a_rejected_save_and_never_retries(
     monkeypatch, tmp_path: Path
 ) -> None:
     calls = _stub_desktop(
@@ -369,11 +404,11 @@ def test_run_row_does_not_retry_an_ambiguous_save_gemini_rejects(
             compared=(),
             detail="the window size changed between captures",
         ),
-        post_verdict=_post_verdict(
-            False, False, ("the record is not visible",)
-        ),
     )
     writer = FakeWriter()
+    confirmer = FakeConfirmer(
+        _confirmation(REJECTED, "error text matched 'duplicate'")
+    )
 
     result = run_row(
         _row(),
@@ -381,14 +416,142 @@ def test_run_row_does_not_retry_an_ambiguous_save_gemini_rejects(
         mapping=_mapping(),
         writer=writer,
         client=object(),
+        confirmation=confirmer,
         screenshot_dir=tmp_path / "shots",
     )
 
     assert result.status == "RECHECK"
     assert result.attempts == 1
     assert calls["save"] == 1
-    assert calls["post"] == 1
+    assert "duplicate" in writer.calls[0][2]
     assert "may already exist" in writer.calls[0][2]
+
+
+def test_save_is_clicked_at_most_once_per_row(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calls = _stub_desktop(
+        monkeypatch,
+        evidence=SaveEvidence(unchanged=False, compared=("Invoice Number",)),
+    )
+    confirmer = FakeConfirmer(_confirmation(UNKNOWN, "no success text"))
+
+    result = run_row(
+        _row(),
+        config=_config(max_attempts=5),
+        mapping=_mapping(),
+        writer=FakeWriter(),
+        client=object(),
+        confirmation=confirmer,
+        screenshot_dir=tmp_path / "shots",
+    )
+
+    assert result.attempts == 1
+    assert calls["save"] == 1
+
+
+def test_before_save_callback_runs_once_and_before_the_click(
+    monkeypatch, tmp_path: Path
+) -> None:
+    order: list[str] = []
+    _stub_desktop(
+        monkeypatch,
+        evidence=SaveEvidence(unchanged=False, compared=("Invoice Number",)),
+        on_save=lambda: order.append("save"),
+    )
+
+    result = run_row(
+        _row(),
+        config=_config(),
+        mapping=_mapping(),
+        writer=FakeWriter(),
+        client=object(),
+        confirmation=FakeConfirmer(_confirmation(CONFIRMED)),
+        on_before_save=lambda _row: order.append("intent"),
+        screenshot_dir=tmp_path / "shots",
+    )
+
+    assert result.status == "DONE"
+    assert order == ["intent", "save"]
+
+
+def test_confirm_each_declines_before_the_intent_and_save(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calls = _stub_desktop(
+        monkeypatch,
+        evidence=SaveEvidence(unchanged=False, compared=("Invoice Number",)),
+    )
+    seen: list[str] = []
+
+    with pytest.raises(RunnerAborted, match="declined"):
+        run_row(
+            _row(),
+            config=_config(),
+            mapping=_mapping(),
+            writer=FakeWriter(),
+            client=object(),
+            confirmation=FakeConfirmer(_confirmation(CONFIRMED)),
+            confirm_each=True,
+            input_func=lambda _prompt: "n",
+            on_before_save=lambda _row: seen.append("intent"),
+            screenshot_dir=tmp_path / "shots",
+        )
+
+    assert calls["save"] == 0
+    assert seen == []
+
+
+def test_confirm_each_accepts_enter(monkeypatch, tmp_path: Path) -> None:
+    calls = _stub_desktop(
+        monkeypatch,
+        evidence=SaveEvidence(unchanged=False, compared=("Invoice Number",)),
+    )
+
+    result = run_row(
+        _row(),
+        config=_config(),
+        mapping=_mapping(),
+        writer=FakeWriter(),
+        client=object(),
+        confirmation=FakeConfirmer(_confirmation(CONFIRMED)),
+        confirm_each=True,
+        input_func=lambda _prompt: "",
+        screenshot_dir=tmp_path / "shots",
+    )
+
+    assert result.status == "DONE"
+    assert calls["save"] == 1
+
+
+def test_a_failed_status_write_is_queued_and_reported(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _stub_desktop(
+        monkeypatch,
+        evidence=SaveEvidence(unchanged=False, compared=("Invoice Number",)),
+    )
+    sidecar = tmp_path / "pending_status.json"
+
+    result = run_row(
+        _row(),
+        config=_config(),
+        mapping=_mapping(),
+        writer=FakeWriter(failures=99),
+        client=object(),
+        confirmation=FakeConfirmer(_confirmation(CONFIRMED)),
+        pending_status_path=sidecar,
+        status_attempts=2,
+        sleep=lambda _seconds: None,
+        screenshot_dir=tmp_path / "shots",
+    )
+
+    assert result.status == "DONE"
+    assert result.status_written is False
+    queued = load_pending_status(sidecar)
+    assert queued is not None
+    assert queued.entries[0].row_number == 2
+    assert queued.entries[0].status == "DONE"
 
 
 def test_run_row_retries_a_read_back_mismatch(monkeypatch, tmp_path: Path) -> None:
@@ -506,7 +669,7 @@ def test_run_row_marks_recheck_when_stopped_after_save(
 
     assert result.status == "RECHECK"
     assert "stopped after Save" in result.error
-    assert calls["post"] == 0
+    assert calls["save"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -619,6 +782,35 @@ def test_run_rows_stops_after_a_recheck_when_configured(monkeypatch) -> None:
     assert result.stopped
     assert result.stopped_row == 2
     assert "stop_on_failure" in result.stop_reason
+
+
+def test_run_rows_stops_when_a_status_could_not_be_written(
+    monkeypatch,
+) -> None:
+    seen: list[int] = []
+
+    def fake_run_row(row, **_kwargs):
+        seen.append(row.row_number)
+        return RowOutcome(
+            row.row_number, "DONE", 1, status_written=False
+        )
+
+    monkeypatch.setattr(row_runner, "run_row", fake_run_row)
+
+    result = run_rows(
+        [_row(2), _row(4)],
+        config=_config(),
+        mapping=_mapping(),
+        writer=FakeWriter(),
+        client=object(),
+    )
+
+    assert seen == [2]
+    assert result.processed == 1
+    assert result.stopped
+    assert result.stopped_row == 2
+    assert "status" in result.stop_reason
+    assert "pending" in result.stop_reason
 
 
 def test_run_rows_reports_an_aborted_row(monkeypatch) -> None:

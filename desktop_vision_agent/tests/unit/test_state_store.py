@@ -11,6 +11,7 @@ from excel_agent.agent.state_store import (
     RUN_STATE_VERSION,
     RunRow,
     RunState,
+    SaveIntent,
     StateError,
     load_run_state,
     save_run_state,
@@ -167,3 +168,48 @@ def test_save_keeps_an_explicit_updated_at(tmp_path: Path) -> None:
     loaded = load_run_state(path)
     assert loaded is not None
     assert loaded.updated_at == "2026-01-01T00:00:00+00:00"
+
+
+def test_round_trip_preserves_a_save_intent(tmp_path: Path) -> None:
+    path = tmp_path / "run_state.json"
+    intent = SaveIntent(
+        row_number=5,
+        invoice_id="INV-0005",
+        state="attempting_save",
+        ts="2026-11-13T10:00:00+00:00",
+    )
+    save_run_state(_state(save_intent=intent), path)
+
+    loaded = load_run_state(path)
+
+    assert loaded is not None
+    assert loaded.save_intent == intent
+
+
+def test_a_state_without_a_save_intent_still_loads(tmp_path: Path) -> None:
+    path = tmp_path / "run_state.json"
+    payload = _state().to_dict()
+    del payload["save_intent"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = load_run_state(path)
+
+    assert loaded is not None
+    assert loaded.save_intent is None
+
+
+def test_a_bad_save_intent_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "run_state.json"
+    payload = _state().to_dict()
+    payload["save_intent"] = {"row_number": "5", "state": "attempting_save"}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(StateError, match="save_intent"):
+        load_run_state(path)
+
+
+def test_a_save_intent_requires_the_attempting_state(tmp_path: Path) -> None:
+    with pytest.raises(StateError, match="attempting_save"):
+        SaveIntent.from_dict(
+            {"row_number": 5, "state": "done", "ts": ""}, "test"
+        )

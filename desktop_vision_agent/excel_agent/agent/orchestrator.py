@@ -13,10 +13,11 @@ to run ``setup`` again.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from ..ai.mapping import ApprovedMapping
 from ..config import AgentConfig, project_root, resolve_path
@@ -26,6 +27,7 @@ from ..desktop.window import attach_window
 from ..excel.reader import ExcelRow
 from ..models.screen import WindowInfo
 from .calibration import ResolvedLayout, resolve_layout
+from .pending_status import write_status_with_retries
 from .row_runner import (
     RowOutcome,
     RunResult,
@@ -35,6 +37,7 @@ from .state_store import (
     DEFAULT_RUN_STATE,
     RunRow,
     RunState,
+    SaveIntent,
     load_run_state,
     save_run_state,
 )
@@ -43,6 +46,9 @@ from .workspace import Workspace
 
 class OrchestratorError(RuntimeError):
     """The run cannot start, resume, or record progress safely."""
+
+
+INTERRUPTED_SAVE_ERROR = "interrupted around Save; verify in target app"
 
 
 def _now() -> str:
@@ -83,6 +89,20 @@ class RunSession:
             fingerprint_text(layout_fingerprint(layout, window.rect))
         )
 
+    def begin_save(self, row_number: int, invoice_id: str = "") -> None:
+        """Persist a write-ahead marker before the Save click."""
+        self._state = replace(
+            self._state,
+            save_intent=SaveIntent(
+                row_number=row_number,
+                invoice_id=invoice_id,
+                state="attempting_save",
+                ts=_now(),
+            ),
+            updated_at=_now(),
+        )
+        self.save()
+
     def record(self, outcome: RowOutcome) -> None:
         """Record one finished row and persist immediately."""
         row = RunRow(
@@ -96,9 +116,16 @@ class RunSession:
             for item in self._state.completed
             if item.row_number != outcome.row_number
         ) + (row,)
+        intent = self._state.save_intent
+        save_intent = (
+            None
+            if intent is None or intent.row_number == outcome.row_number
+            else intent
+        )
         self._state = replace(
             self._state,
             completed=completed,
+            save_intent=save_intent,
             updated_at=_now(),
         )
         self.save()
@@ -259,6 +286,71 @@ def validate_resume(
                 "the working copy changed, so this run cannot be resumed"
             )
 
+    if state.save_intent is not None:
+        intent = state.save_intent
+        if intent.row_number not in state.pending:
+            raise OrchestratorError(
+                f"the run state records row {intent.row_number} as attempting "
+                "Save but it is not part of this run"
+            )
+        if intent.row_number in state.completed_numbers:
+            raise OrchestratorError(
+                f"the run state records row {intent.row_number} as both "
+                "finished and attempting Save; the state file is inconsistent"
+            )
+
+
+def reconcile_interrupted_save(
+    session: RunSession,
+    *,
+    writer,
+    recheck_value: str,
+    output: Callable[[str], None] = print,
+    attempts: int = 3,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Turn an unresolved write-ahead intent into an explicit RECHECK.
+
+    The row is never retried automatically: the agent cannot know whether the
+    Save landed. The user must verify it in the target application.
+    """
+    intent = session.state.save_intent
+    if intent is None:
+        return False
+    if intent.state != "attempting_save":
+        raise OrchestratorError(
+            f"row {intent.row_number} has an unknown save intent state "
+            f"{intent.state!r}"
+        )
+
+    ok, failure = write_status_with_retries(
+        writer.write_status,
+        intent.row_number,
+        recheck_value,
+        INTERRUPTED_SAVE_ERROR,
+        attempts=attempts,
+        sleep=sleep,
+    )
+    if not ok:
+        raise OrchestratorError(
+            f"could not mark row {intent.row_number} as {recheck_value} after "
+            f"an interrupted Save: {failure}; fix workbook access and resume"
+        )
+
+    session.record(
+        RowOutcome(
+            row_number=intent.row_number,
+            status=recheck_value,
+            attempts=0,
+            error=INTERRUPTED_SAVE_ERROR,
+        )
+    )
+    output(
+        f"Row {intent.row_number}: {recheck_value} - "
+        f"{INTERRUPTED_SAVE_ERROR}"
+    )
+    return True
+
 
 def resume_rows(
     state: RunState, rows: Sequence[ExcelRow]
@@ -353,10 +445,12 @@ def resume_preflight(
 
 
 __all__ = [
+    "INTERRUPTED_SAVE_ERROR",
     "OrchestratorError",
     "ResumePreflight",
     "RunSession",
     "fingerprint_text",
+    "reconcile_interrupted_save",
     "resume_preflight",
     "resume_rows",
     "resume_run",

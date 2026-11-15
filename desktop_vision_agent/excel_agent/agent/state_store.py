@@ -73,6 +73,54 @@ class RunRow:
 
 
 @dataclass(frozen=True)
+class SaveIntent:
+    """A write-ahead marker written immediately before the Save click."""
+
+    row_number: int
+    invoice_id: str = ""
+    state: str = "attempting_save"
+    ts: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "row_number": self.row_number,
+            "invoice_id": self.invoice_id,
+            "state": self.state,
+            "ts": self.ts,
+        }
+
+    @classmethod
+    def from_dict(cls, data: object, source: str) -> "SaveIntent":
+        if not isinstance(data, dict):
+            raise StateError(f"{source} save_intent must be an object")
+        row_number = data.get("row_number")
+        invoice_id = data.get("invoice_id", "")
+        state = data.get("state")
+        ts = data.get("ts", "")
+        if not isinstance(row_number, int) or isinstance(row_number, bool):
+            raise StateError(
+                f"{source} save_intent is missing a row_number"
+            )
+        if not isinstance(invoice_id, str):
+            raise StateError(
+                f"{source} save_intent has a bad invoice_id value"
+            )
+        if state != "attempting_save":
+            raise StateError(
+                f"{source} save_intent state must be 'attempting_save', "
+                f"got {state!r}"
+            )
+        if not isinstance(ts, str):
+            raise StateError(f"{source} save_intent has a bad ts value")
+        return cls(
+            row_number=row_number,
+            invoice_id=invoice_id,
+            state=state,
+            ts=ts,
+        )
+
+
+@dataclass(frozen=True)
 class RunState:
     """The persisted description of one batch run."""
 
@@ -89,6 +137,7 @@ class RunState:
     layout_fingerprint: str = ""
     pending: tuple[int, ...] = ()
     completed: tuple[RunRow, ...] = ()
+    save_intent: SaveIntent | None = None
     stopped: bool = False
     stopped_row: int | None = None
     stop_reason: str = ""
@@ -125,6 +174,11 @@ class RunState:
             "layout_fingerprint": self.layout_fingerprint,
             "pending": list(self.pending),
             "completed": [row.to_dict() for row in self.completed],
+            "save_intent": (
+                self.save_intent.to_dict()
+                if self.save_intent is not None
+                else None
+            ),
             "stopped": self.stopped,
             "stopped_row": self.stopped_row,
             "stop_reason": self.stop_reason,
@@ -153,6 +207,13 @@ class RunState:
             raise StateError(f"{source} completed must be a list")
         completed = tuple(
             RunRow.from_dict(item, source) for item in completed_raw
+        )
+
+        intent_raw = data.get("save_intent")
+        save_intent = (
+            SaveIntent.from_dict(intent_raw, source)
+            if intent_raw is not None
+            else None
         )
 
         window = data.get("window", {})
@@ -185,6 +246,7 @@ class RunState:
             layout_fingerprint=str(data.get("layout_fingerprint", "")),
             pending=pending,
             completed=completed,
+            save_intent=save_intent,
             stopped=stopped,
             stopped_row=stopped_row,
             stop_reason=str(data.get("stop_reason", "")),
@@ -263,6 +325,7 @@ __all__ = [
     "RUN_STATE_VERSION",
     "RunRow",
     "RunState",
+    "SaveIntent",
     "StateError",
     "load_run_state",
     "save_run_state",

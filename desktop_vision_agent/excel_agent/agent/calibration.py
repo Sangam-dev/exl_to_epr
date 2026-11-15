@@ -19,7 +19,7 @@ from PIL import Image, ImageChops
 
 from ..ai.client import GeminiClient, GeminiError
 from ..ai.mapping import ApprovedMapping, MappingError, mark_trusted
-from ..ai.verification import check_post_save, check_pre_save
+from ..ai.verification import check_pre_save
 from ..config import AgentConfig, project_root
 from ..desktop.capture import Capture, CaptureError, capture_window
 from ..desktop.coordinates import rect_within
@@ -36,10 +36,24 @@ from ..desktop.input import (
 from ..desktop.uia import UIAError, UIAInspection, inspect_window
 from ..desktop.window import WindowError, attach_window
 from ..excel.reader import ExcelRow, format_value
-from ..excel.writer import ExcelWriteError, WorkbookWriter
+from ..excel.writer import WorkbookWriter
 from ..models.screen import Rect
 from ..models.verification import VerificationError
 from ..safety.controller import SafetyController
+from .confirmation import (
+    CONFIRMED,
+    REJECTED,
+    ConfirmationError,
+    GeminiTextReader,
+    SaveConfirmer,
+    TextConfirmation,
+)
+from .pending_status import (
+    DEFAULT_PENDING_STATUS,
+    PendingStatusError,
+    queue_pending_status,
+    write_status_with_retries,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +109,7 @@ class CalibrationResult:
     trusted: bool
     error: str = ""
     screenshots: tuple[Path, ...] = ()
+    status_written: bool = True
 
 
 def _normalise(text: str) -> str:
@@ -453,18 +468,41 @@ def _persist_trust(
     return trusted
 
 
-def _write_status(
+def _persist_status(
     writer: WorkbookWriter,
     row: ExcelRow,
     status: str,
     error: str = "",
-) -> None:
+    *,
+    pending_status_path: str | Path | None = None,
+    status_attempts: int = 3,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    ok, failure = write_status_with_retries(
+        writer.write_status,
+        row.row_number,
+        status,
+        error,
+        attempts=status_attempts,
+        sleep=sleep,
+    )
+    if ok:
+        return True
+    sidecar = (
+        Path(pending_status_path)
+        if pending_status_path is not None
+        else DEFAULT_PENDING_STATUS
+    )
     try:
-        writer.write_status(row.row_number, status, error=error)
-    except ExcelWriteError as exc:
-        raise CalibrationError(
-            f"could not write {status!r} for row {row.row_number}: {exc}"
-        ) from exc
+        queue_pending_status(
+            row_number=row.row_number,
+            status=status,
+            error=error,
+            path=sidecar,
+        )
+    except PendingStatusError:
+        pass
+    return False
 
 
 def _recheck(
@@ -478,17 +516,35 @@ def _recheck(
     attempts: int,
     screenshots: list[Path],
     output: Callable[[str], None],
+    pending_status_path: str | Path | None = None,
+    status_attempts: int = 3,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> CalibrationResult:
     _persist_trust(mapping, mapping_path, False, output)
-    _write_status(writer, row, config.excel.recheck_value, error)
-    output(f"Row {row.row_number}: {config.excel.recheck_value} - {error}")
+    written = _persist_status(
+        writer,
+        row,
+        config.excel.recheck_value,
+        error,
+        pending_status_path=pending_status_path,
+        status_attempts=status_attempts,
+        sleep=sleep,
+    )
+    final_error = error
+    if not written:
+        final_error = (
+            f"{error} | status could not be written; queued in "
+            f"{pending_status_path or DEFAULT_PENDING_STATUS}"
+        )
+    output(f"Row {row.row_number}: {config.excel.recheck_value} - {final_error}")
     return CalibrationResult(
         row_number=row.row_number,
         status=config.excel.recheck_value,
         attempts=attempts,
         trusted=False,
-        error=error,
+        error=final_error,
         screenshots=tuple(screenshots),
+        status_written=written,
     )
 
 
@@ -501,14 +557,41 @@ def calibrate_row(
     client: GeminiClient,
     mapping_path: str | Path | None = None,
     controller: SafetyController | None = None,
+    confirmation: SaveConfirmer | None = None,
     screenshot_dir: str | Path | None = None,
+    pending_status_path: str | Path | None = None,
+    status_attempts: int = 3,
+    sleep: Callable[[float], None] = time.sleep,
     output: Callable[[str], None] = print,
 ) -> CalibrationResult:
-    """Fill, verify, save, and verify one calibration row."""
+    """Fill, verify, save, and confirm one calibration row."""
     if not mapping.entries:
         raise CalibrationError("the approved mapping has no column -> field entries")
     if mapping.button_for_role("save") is None:
         raise CalibrationError("the approved mapping has no Save button")
+
+    if confirmation is None:
+        confirmation = TextConfirmation(
+            config.confirmation, GeminiTextReader(client)
+        )
+
+    def recheck(
+        *, error: str, attempts: int, screenshots: list[Path]
+    ) -> CalibrationResult:
+        return _recheck(
+            row,
+            config,
+            writer,
+            mapping,
+            mapping_path,
+            error=error,
+            attempts=attempts,
+            screenshots=screenshots,
+            output=output,
+            pending_status_path=pending_status_path,
+            status_attempts=status_attempts,
+            sleep=sleep,
+        )
 
     missing = [
         entry.column
@@ -529,16 +612,10 @@ def calibrate_row(
             for entry in mapping.entries
         }
     except ValueError as exc:
-        return _recheck(
-            row,
-            config,
-            writer,
-            mapping,
-            mapping_path,
+        return recheck(
             error=f"row {row.row_number} has an invalid value: {exc}",
             attempts=0,
             screenshots=[],
-            output=output,
         )
 
     directory = (
@@ -619,18 +696,10 @@ def calibrate_row(
             saved = True
 
             if not _wait(controller, config.actions.wait_after_save_seconds):
-                return _recheck(
-                    row,
-                    config,
-                    writer,
-                    mapping,
-                    mapping_path,
-                    error=(
-                        "stopped after Save; the record may already exist"
-                    ),
+                return recheck(
+                    error="stopped after Save; the record may already exist",
                     attempts=attempt,
                     screenshots=screenshots,
-                    output=output,
                 )
 
             post = capture_window(window)
@@ -638,36 +707,31 @@ def calibrate_row(
                 post, directory, row.row_number, attempt, "post_save"
             )
             screenshots.append(post_path)
-            evidence = compare_saved_fields(pre, post, layout, values)
-            output(f"  post-save screenshot: {post_path} ({evidence.detail})")
-
-            post_verdict = check_post_save(
-                client,
-                pre,
-                post,
-                mapping.entries,
-                values,
-                config.gemini,
-                on_attempt=_heartbeat(controller),
+            hint = compare_saved_fields(pre, post, layout, values).detail
+            output(f"  post-save screenshot: {post_path} ({hint})")
+            result = confirmation.confirm(post.image, weak_hint=hint)
+            output(
+                f"  save confirmation: {result.outcome} ({result.reason})"
             )
             if not _running(controller):
-                return _recheck(
-                    row,
-                    config,
-                    writer,
-                    mapping,
-                    mapping_path,
+                return recheck(
                     error=(
-                        "stopped during post-save verification; the record "
+                        "stopped during post-save confirmation; the record "
                         "may already exist"
                     ),
                     attempts=attempt,
                     screenshots=screenshots,
-                    output=output,
                 )
 
-            if post_verdict.approved and not evidence.unchanged:
-                _write_status(writer, row, config.excel.done_value)
+            if result.outcome == CONFIRMED:
+                written = _persist_status(
+                    writer,
+                    row,
+                    config.excel.done_value,
+                    pending_status_path=pending_status_path,
+                    status_attempts=status_attempts,
+                    sleep=sleep,
+                )
                 trusted = _persist_trust(
                     mapping, mapping_path, True, output
                 )
@@ -675,53 +739,44 @@ def calibrate_row(
                     f"Row {row.row_number}: {config.excel.done_value} "
                     f"(map trusted={trusted})"
                 )
+                error = ""
+                if not written:
+                    error = (
+                        f"status {config.excel.done_value!r} could not be "
+                        "written; queued in "
+                        f"{pending_status_path or DEFAULT_PENDING_STATUS}"
+                    )
+                    output(f"  WARNING: {error}")
                 return CalibrationResult(
                     row_number=row.row_number,
                     status=config.excel.done_value,
                     attempts=attempt,
                     trusted=trusted,
+                    error=error,
                     screenshots=tuple(screenshots),
+                    status_written=written,
                 )
 
-            if evidence.unchanged:
-                message = "; ".join(post_verdict.issues) or (
-                    "the filled fields are unchanged"
+            if result.outcome == REJECTED:
+                message = (
+                    f"save rejected: {result.reason}; the record may already "
+                    "exist, so the row was not saved again"
                 )
-                return _recheck(
-                    row,
-                    config,
-                    writer,
-                    mapping,
-                    mapping_path,
-                    error=(
-                        "the filled fields are unchanged after Save; the "
-                        "record may already exist, so the row was not saved "
-                        f"again: {message}"
-                    ),
-                    attempts=attempt,
-                    screenshots=screenshots,
-                    output=output,
+            else:
+                message = (
+                    "record may already exist: "
+                    f"{result.reason or 'the save could not be confirmed'}"
                 )
-
-            message = "; ".join(post_verdict.issues) or "no reason given"
-            return _recheck(
-                row,
-                config,
-                writer,
-                mapping,
-                mapping_path,
-                error=(
-                    "post-save check uncertain; the record may already exist: "
-                    f"{message}"
-                ),
+            return recheck(
+                error=message,
                 attempts=attempt,
                 screenshots=screenshots,
-                output=output,
             )
 
         except CalibrationAborted:
             raise
         except (
+            ConfirmationError,
             GeminiError,
             VerificationError,
             UIAError,
@@ -731,19 +786,13 @@ def calibrate_row(
             CalibrationError,
         ) as exc:
             if saved:
-                return _recheck(
-                    row,
-                    config,
-                    writer,
-                    mapping,
-                    mapping_path,
+                return recheck(
                     error=(
                         "post-save verification failed after Save; the record "
                         f"may already exist: {exc}"
                     ),
                     attempts=attempt,
                     screenshots=screenshots,
-                    output=output,
                 )
             issues.append(f"attempt {attempt}: {exc}")
             output(f"  attempt failed: {exc}")
@@ -753,16 +802,10 @@ def calibrate_row(
         f"calibration failed after {attempts} attempt(s): "
         + " | ".join(issues[-4:])
     )
-    return _recheck(
-        row,
-        config,
-        writer,
-        mapping,
-        mapping_path,
+    return recheck(
         error=error,
         attempts=attempts,
         screenshots=screenshots,
-        output=output,
     )
 
 

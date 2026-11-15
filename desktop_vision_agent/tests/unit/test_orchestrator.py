@@ -11,8 +11,10 @@ from PIL import Image
 from excel_agent.agent import orchestrator
 from excel_agent.agent.calibration import ResolvedLayout, ResolvedTarget
 from excel_agent.agent.orchestrator import (
+    INTERRUPTED_SAVE_ERROR,
     OrchestratorError,
     RunSession,
+    reconcile_interrupted_save,
     resume_preflight,
     resume_rows,
     resume_run,
@@ -23,6 +25,7 @@ from excel_agent.agent.row_runner import RowOutcome, RunResult
 from excel_agent.agent.state_store import (
     RunRow,
     RunState,
+    SaveIntent,
     load_run_state,
     save_run_state,
 )
@@ -232,6 +235,140 @@ def test_abort_points_at_the_first_remaining_row(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Write-ahead save intent
+# ---------------------------------------------------------------------------
+
+
+def test_begin_save_persists_an_attempting_intent(tmp_path: Path) -> None:
+    session = _start(tmp_path)
+
+    session.begin_save(4, "INV-4")
+
+    loaded = load_run_state(session.path)
+    assert loaded is not None
+    assert loaded.save_intent is not None
+    assert loaded.save_intent.row_number == 4
+    assert loaded.save_intent.invoice_id == "INV-4"
+    assert loaded.save_intent.state == "attempting_save"
+    assert loaded.save_intent.ts
+
+
+def test_recording_a_row_clears_its_intent(tmp_path: Path) -> None:
+    session = _start(tmp_path)
+    session.begin_save(4, "INV-4")
+
+    session.record(RowOutcome(4, "DONE", 1))
+
+    loaded = load_run_state(session.path)
+    assert loaded is not None
+    assert loaded.save_intent is None
+    assert loaded.completed_numbers == {4}
+
+
+def test_recording_a_different_row_keeps_the_intent(tmp_path: Path) -> None:
+    session = _start(tmp_path)
+    session.begin_save(4, "INV-4")
+
+    session.record(RowOutcome(5, "DONE", 1))
+
+    loaded = load_run_state(session.path)
+    assert loaded is not None
+    assert loaded.save_intent is not None
+    assert loaded.save_intent.row_number == 4
+
+
+class FakeWriter:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, str, str]] = []
+
+    def write_status(
+        self, row_number: int, status: str, error: str = "", timestamp=None
+    ) -> None:
+        self.calls.append((row_number, status, error))
+
+
+def test_reconcile_marks_an_interrupted_save_as_recheck(tmp_path: Path) -> None:
+    session = _start(tmp_path)
+    session.begin_save(4, "INV-4")
+    writer = FakeWriter()
+
+    changed = reconcile_interrupted_save(
+        session,
+        writer=writer,
+        recheck_value="RECHECK",
+        output=lambda _line: None,
+    )
+
+    assert changed is True
+    assert writer.calls == [(4, "RECHECK", INTERRUPTED_SAVE_ERROR)]
+    loaded = load_run_state(session.path)
+    assert loaded is not None
+    assert loaded.save_intent is None
+    assert loaded.completed == (
+        RunRow(4, "RECHECK", 0, INTERRUPTED_SAVE_ERROR),
+    )
+
+
+def test_reconcile_is_a_noop_without_an_intent(tmp_path: Path) -> None:
+    session = _start(tmp_path)
+    writer = FakeWriter()
+
+    changed = reconcile_interrupted_save(
+        session,
+        writer=writer,
+        recheck_value="RECHECK",
+        output=lambda _line: None,
+    )
+
+    assert changed is False
+    assert writer.calls == []
+
+
+def test_reconcile_keeps_the_intent_when_the_status_write_fails(
+    tmp_path: Path,
+) -> None:
+    session = _start(tmp_path)
+    session.begin_save(4, "INV-4")
+
+    class FailingWriter:
+        def write_status(self, *_args, **_kwargs) -> None:
+            raise OSError("workbook is open")
+
+    with pytest.raises(OrchestratorError, match="could not mark row 4"):
+        reconcile_interrupted_save(
+            session,
+            writer=FailingWriter(),
+            recheck_value="RECHECK",
+            output=lambda _line: None,
+            attempts=1,
+            sleep=lambda _seconds: None,
+        )
+
+    loaded = load_run_state(session.path)
+    assert loaded is not None
+    assert loaded.save_intent is not None
+
+
+def test_a_reconciled_row_is_not_selected_again(tmp_path: Path) -> None:
+    session = _start(tmp_path, rows=[_row(4), _row(5)])
+    session.begin_save(4, "INV-4")
+    writer = FakeWriter()
+    reconcile_interrupted_save(
+        session,
+        writer=writer,
+        recheck_value="RECHECK",
+        output=lambda _line: None,
+    )
+
+    selected, skipped = resume_rows(
+        session.state, [_row(4), _row(5)]
+    )
+
+    assert [row.row_number for row in selected] == [5]
+    assert skipped == []
+
+
+# ---------------------------------------------------------------------------
 # Resume validation
 # ---------------------------------------------------------------------------
 
@@ -348,6 +485,37 @@ def test_validate_resume_rejects_a_completed_row_outside_the_run(
 
     with pytest.raises(OrchestratorError, match="not part of this run"):
         _validate(tmp_path, state)
+
+
+def test_validate_resume_rejects_an_intent_outside_the_run(
+    tmp_path: Path,
+) -> None:
+    session = _start(tmp_path)
+    state = replace(
+        session.state,
+        save_intent=SaveIntent(99, "INV-99", "attempting_save", "now"),
+    )
+
+    with pytest.raises(OrchestratorError, match="not part of this run"):
+        _validate(tmp_path, state)
+
+
+def test_validate_resume_rejects_an_intent_for_a_completed_row(
+    tmp_path: Path,
+) -> None:
+    session = _start(tmp_path)
+    state = replace(
+        session.state,
+        completed=(RunRow(4, "DONE", 1),),
+        save_intent=SaveIntent(4, "INV-4", "attempting_save", "now"),
+    )
+
+    with pytest.raises(OrchestratorError, match="both finished and attempting"):
+        _validate(
+            tmp_path,
+            state,
+            rows=[_row(4, status="DONE"), _row(5)],
+        )
 
 
 def test_resume_run_requires_a_state_file(tmp_path: Path) -> None:

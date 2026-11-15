@@ -726,6 +726,12 @@ def run_calibrate(
         CalibrationError,
         calibrate_row,
     )
+    from .agent.confirmation import GeminiTextReader, TextConfirmation
+    from .agent.pending_status import (
+        DEFAULT_PENDING_STATUS,
+        PendingStatusError,
+        apply_pending_statuses,
+    )
     from .agent.workspace import WorkspaceError, open_workspace
     from .ai.client import GeminiClient, GeminiError
     from .ai.mapping import DEFAULT_MAPPING_PATH, MappingError, load_mapping
@@ -758,9 +764,40 @@ def run_calibrate(
 
     try:
         workspace = open_workspace(config)
+        status_writer = WorkbookWriter.from_config(config, path=workspace.path)
+    except (ExcelWriteError, WorkspaceError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    try:
+        applied, remaining = apply_pending_statuses(
+            status_writer.write_status, path=DEFAULT_PENDING_STATUS
+        )
+    except PendingStatusError as exc:
+        status_writer.close()
+        print(f"ERROR: {exc}")
+        return 1
+    if remaining:
+        status_writer.close()
+        print(
+            f"ERROR: {len(remaining)} saved outcome(s) still could not be "
+            f"written to the workbook; see {DEFAULT_PENDING_STATUS}. Fix "
+            "workbook access and run again before calibrating."
+        )
+        for entry in remaining:
+            print(f"  row {entry.row_number}: {entry.status} - {entry.error}")
+        return 1
+    if applied:
+        print(
+            f"Applied {len(applied)} pending status(es): "
+            + ", ".join(str(number) for number in applied)
+        )
+    status_writer.close()
+
+    try:
         workbook = read_workbook(config, workspace.path)
         pending = pending_rows(workbook, config)
-    except (ExcelReadError, ExcelWriteError, WorkspaceError) as exc:
+    except (ExcelReadError, ExcelWriteError) as exc:
         print(f"ERROR: {exc}")
         return 1
 
@@ -787,6 +824,9 @@ def run_calibrate(
         window = attach_window(config.app)
         writer = WorkbookWriter.from_config(config, path=workspace.path)
         client = GeminiClient(config.gemini)
+        confirmation = TextConfirmation(
+            config.confirmation, GeminiTextReader(client)
+        )
         hotkeys = hotkeys_from_config(config.safety)
     except (
         WindowError,
@@ -831,6 +871,8 @@ def run_calibrate(
             client=client,
             mapping_path=mapping_file,
             controller=controller,
+            confirmation=confirmation,
+            pending_status_path=DEFAULT_PENDING_STATUS,
         )
     except CalibrationAborted as exc:
         print(f"Stopped: {exc}")
@@ -854,13 +896,23 @@ def run_calibrate(
     print(f"Row {result.row_number}: {result.status}")
     print(f"Attempts: {result.attempts}")
     print(f"Map trusted: {result.trusted}")
+    if not result.status_written:
+        print(
+            f"WARNING: the {result.status} status could not be written; it "
+            f"was queued in {DEFAULT_PENDING_STATUS}. Apply it before "
+            "processing more rows."
+        )
     if result.error:
         print(f"Error: {result.error}")
     for path in result.screenshots:
         print(f"Screenshot: {path}")
     print(f"AI calls: {client.calls}")
     print(f"Output workbook: {writer.path}")
-    return 0 if result.status == config.excel.done_value else 1
+    return (
+        0
+        if result.status == config.excel.done_value and result.status_written
+        else 1
+    )
 
 
 def _abs_path(value: str | Path) -> str:
@@ -933,6 +985,7 @@ def run_batch(
     env_path: str | None = None,
     state_path: str | None = None,
     resume: bool = False,
+    confirm_each: bool = False,
 ) -> int:
     """Process pending rows with the trusted coordinate map.
 
@@ -940,12 +993,18 @@ def run_batch(
     continues that recorded set after a stop, skipping every row that already
     carries a status.
     """
+    from .agent.confirmation import GeminiTextReader, TextConfirmation
     from .agent.orchestrator import (
         OrchestratorError,
+        reconcile_interrupted_save,
         resume_preflight,
         resume_rows,
         resume_run,
         start_run,
+    )
+    from .agent.pending_status import (
+        PendingStatusError,
+        apply_pending_statuses,
     )
     from .agent.row_runner import RunnerError, RunResult, run_rows
     from .agent.state_store import (
@@ -1009,6 +1068,17 @@ def run_batch(
         previous = load_run_state(state_file) if state_file.is_file() else None
     except StateError as exc:
         print(f"ERROR: {exc}")
+        return 1
+
+    if not resume and previous is not None and previous.save_intent is not None:
+        intent = previous.save_intent
+        print(
+            f"ERROR: the recorded run was interrupted around Save for row "
+            f"{intent.row_number}"
+            + (f" (invoice {intent.invoice_id!r})" if intent.invoice_id else "")
+            + f". Run `python main.py resume` so the row is marked RECHECK "
+            "for manual verification; a fresh run will not touch it."
+        )
         return 1
 
     if not resume and previous is not None and previous.unfinished:
@@ -1080,10 +1150,44 @@ def run_batch(
         else None
     )
 
+    pending_status_path = state_file.parent / "pending_status.json"
+
     try:
         workspace = open_workspace(config, preferred_path=preferred)
+        status_writer = WorkbookWriter.from_config(config, path=workspace.path)
+    except (ExcelWriteError, WorkspaceError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    try:
+        applied, remaining = apply_pending_statuses(
+            status_writer.write_status, path=pending_status_path
+        )
+    except PendingStatusError as exc:
+        status_writer.close()
+        print(f"ERROR: {exc}")
+        return 1
+    if remaining:
+        status_writer.close()
+        print(
+            f"ERROR: {len(remaining)} saved outcome(s) still could not be "
+            f"written to the workbook; see {pending_status_path}. Fix workbook "
+            "access and run again before processing any row."
+        )
+        for entry in remaining:
+            print(f"  row {entry.row_number}: {entry.status} - {entry.error}")
+        return 1
+    if applied:
+        print(
+            f"Applied {len(applied)} pending status(es) from "
+            f"{pending_status_path}: "
+            + ", ".join(str(number) for number in applied)
+        )
+
+    try:
         workbook = read_workbook(config, workspace.path)
-    except (ExcelReadError, ExcelWriteError, WorkspaceError) as exc:
+    except (ExcelReadError, ExcelWriteError) as exc:
+        status_writer.close()
         print(f"ERROR: {exc}")
         return 1
 
@@ -1102,13 +1206,20 @@ def run_batch(
                 workspace=workspace,
                 rows=workbook.rows,
             )
+            reconcile_interrupted_save(
+                session,
+                writer=status_writer,
+                recheck_value=config.excel.recheck_value,
+            )
             selected, skipped = resume_rows(session.state, workbook.rows)
         except (StateError, OrchestratorError) as exc:
+            status_writer.close()
             print(f"ERROR: {exc}")
             return 1
 
         issues = validate_pending_rows(selected, config)
         if issues:
+            status_writer.close()
             print(f"ERROR: {len(issues)} validation issue(s); nothing was processed:")
             for issue in issues:
                 print(f"  - {issue}")
@@ -1117,17 +1228,20 @@ def run_batch(
         pending = pending_rows(workbook, config)
         issues = validate_pending_rows(pending, config)
         if issues:
+            status_writer.close()
             print(f"ERROR: {len(issues)} validation issue(s); nothing was processed:")
             for issue in issues:
                 print(f"  - {issue}")
             return 1
         if not pending:
+            status_writer.close()
             print(f"Working copy: {workspace.path}")
             print("No pending rows; nothing to run.")
             return 0
         selected = pending[:limit] if limit is not None else pending
 
     if not selected:
+        status_writer.close()
         print(f"Run state: {state_file}")
         print("Nothing left to process for this run.")
         if session is not None:
@@ -1137,10 +1251,15 @@ def run_batch(
                 print(f"WARNING: could not clear the finished run state: {exc}")
         return 0
 
+    status_writer.close()
+
     try:
         window = attach_window(config.app)
         writer = WorkbookWriter.from_config(config, path=workspace.path)
         client = GeminiClient(config.gemini)
+        confirmation = TextConfirmation(
+            config.confirmation, GeminiTextReader(client)
+        )
         hotkeys = hotkeys_from_config(config.safety)
     except (
         WindowError,
@@ -1194,7 +1313,7 @@ def run_batch(
     )
     print(
         f"Gemini: {config.gemini.model} "
-        "(used only when the save is ambiguous)"
+        "(reads the confirmation text region after Save)"
     )
     print(
         f"  {labels['stop']} stop | {labels['pause']} pause | "
@@ -1264,6 +1383,12 @@ def run_batch(
             writer=writer,
             client=client,
             controller=controller,
+            confirmation=confirmation,
+            on_before_save=lambda row: session.begin_save(
+                row.row_number, str(row.values.get(config.excel.id_column, ""))
+            ),
+            confirm_each=confirm_each,
+            pending_status_path=pending_status_path,
             on_row=session.record,
             on_layout=session.observe_layout,
         )
@@ -1506,6 +1631,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not show the status overlay",
     )
+    run_parser.add_argument(
+        "--confirm-each",
+        action="store_true",
+        help="pause for Enter/Y before every Save click",
+    )
 
     resume_parser = subparsers.add_parser(
         "resume", help="continue a stopped run from its saved state (Segment 8)"
@@ -1614,6 +1744,7 @@ def main(argv: list[str] | None = None) -> int:
             overlay=not args.no_overlay,
             env_path=args.env_file,
             state_path=args.state,
+            confirm_each=args.confirm_each,
         )
 
     if args.command == "resume":

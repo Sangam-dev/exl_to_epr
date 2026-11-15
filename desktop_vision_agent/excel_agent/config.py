@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -139,6 +140,73 @@ class GeminiConfig(BaseModel):
         return value
 
 
+class NormalizedRegion(BaseModel):
+    """A rectangle in 0-1000 normalized window coordinates."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    x1: int = Field(ge=0, le=1000)
+    y1: int = Field(ge=0, le=1000)
+    x2: int = Field(ge=0, le=1000)
+    y2: int = Field(ge=0, le=1000)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "NormalizedRegion":
+        if self.x2 <= self.x1:
+            raise ValueError("normalized region x2 must be greater than x1")
+        if self.y2 <= self.y1:
+            raise ValueError("normalized region y2 must be greater than y1")
+        return self
+
+    def to_pixels(self, width: int, height: int) -> tuple[int, int, int, int]:
+        """Convert to a PIL crop box, clamped to the image bounds."""
+        left = max(0, min(width - 1, round(width * self.x1 / 1000)))
+        top = max(0, min(height - 1, round(height * self.y1 / 1000)))
+        right = max(left + 1, min(width, round(width * self.x2 / 1000)))
+        bottom = max(top + 1, min(height, round(height * self.y2 / 1000)))
+        return left, top, right, bottom
+
+
+def _compile_pattern(value: str) -> None:
+    try:
+        re.compile(value)
+    except re.error as exc:
+        raise ValueError(
+            f"invalid regular expression {value!r}: {exc}"
+        ) from exc
+
+
+class ConfirmationConfig(BaseModel):
+    """Where and how to read positive/negative Save evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    success_region: NormalizedRegion | None = None
+    error_region: NormalizedRegion | None = None
+    success_pattern: str = ""
+    error_patterns: list[str] = Field(default_factory=list)
+
+    @field_validator("success_pattern")
+    @classmethod
+    def _valid_success_pattern(cls, value: str) -> str:
+        value = value.strip()
+        if value:
+            _compile_pattern(value)
+        return value
+
+    @field_validator("error_patterns")
+    @classmethod
+    def _valid_error_patterns(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for value in values:
+            value = value.strip()
+            if not value:
+                raise ValueError("error_patterns must not contain empty patterns")
+            _compile_pattern(value)
+            cleaned.append(value)
+        return cleaned
+
+
 class SafetyConfig(BaseModel):
     """Input lock and failure policy."""
 
@@ -150,7 +218,7 @@ class SafetyConfig(BaseModel):
     block_external_input: bool = True
     max_attempts: int = Field(default=3, ge=1)
     action_delay_seconds: float = Field(default=0.15, ge=0)
-    stop_on_failure: bool = False
+    stop_on_failure: bool = True
 
     @field_validator("stop_hotkey", "pause_hotkey", "resume_hotkey")
     @classmethod
@@ -181,6 +249,7 @@ class AgentConfig(BaseModel):
     fields: list[FieldConfig] = Field(default_factory=list)
     actions: ActionsConfig
     gemini: GeminiConfig = Field(default_factory=GeminiConfig)
+    confirmation: ConfirmationConfig = Field(default_factory=ConfirmationConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
 
     @model_validator(mode="after")

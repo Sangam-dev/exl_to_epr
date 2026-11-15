@@ -164,7 +164,7 @@ def run_demo(clean: bool = True) -> int:
     log("CALIBRATE", "Pre-save visual verification: APPROVED (entered data matches Excel)")
     log("CALIBRATE", "Save action dispatched to form.")
     time.sleep(0.15)
-    log("CALIBRATE", "Post-save pixel verification: SAVED (delta detected)")
+    log("CALIBRATE", "Post-save text confirmation: CONFIRMED (simulated success text)")
     mapping = mark_trusted(mapping, mapping_path)
     log("CALIBRATE", "Mapping validated and elevated to trusted: true")
 

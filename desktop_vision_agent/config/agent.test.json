@@ -38,6 +38,12 @@
     "min_layout_confidence": 0.6,
     "min_mapping_confidence": 0.6
   },
+  "confirmation": {
+    "success_region": { "x1": 20, "y1": 480, "x2": 980, "y2": 600 },
+    "error_region": { "x1": 20, "y1": 480, "x2": 980, "y2": 600 },
+    "success_pattern": "(?i)saved\\s+\\d{1,2}:\\d{2}:\\d{2}",
+    "error_patterns": ["(?i)required", "(?i)error", "(?i)invalid"]
+  },
   "safety": {
     "stop_hotkey": "alt+t",
     "pause_hotkey": "alt+p",
@@ -45,6 +51,6 @@
     "block_external_input": true,
     "max_attempts": 3,
     "action_delay_seconds": 0.15,
-    "stop_on_failure": false
+    "stop_on_failure": true
   }
 }

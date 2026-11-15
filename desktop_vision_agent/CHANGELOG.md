@@ -3,6 +3,53 @@
 All notable changes to this project are recorded here. One entry per tagged
 segment.
 
+## [v0.9.10-save-confirmation] - 2026-11-13
+
+### Added
+
+- `agent/confirmation.py`: explicit `CONFIRMED` / `REJECTED` / `UNKNOWN` save
+  confirmation. The strategy reads configured success/error text regions
+  through an injectable `text_reader`; `GeminiTextReader` is the only real
+  reader, and `config/prompts/read_region_text.md` transcribes the crop.
+- `confirmation` config block: normalized 0-1000 `success_region` /
+  `error_region`, a `success_pattern`, and `error_patterns`. Invalid regular
+  expressions are rejected at config load.
+- `agent/pending_status.py`: atomic `data/state/pending_status.json` sidecar
+  plus `write_status_with_retries` with exponential backoff. Pending statuses
+  are replayed before any row is read on the next run/resume.
+- Write-ahead save intent (`state: "attempting_save"`) persisted in
+  `run_state.json` immediately before every Save click.
+- `run --confirm-each` pauses for Enter/Y before each Save.
+- `safety.stop_on_failure` now defaults to `true` in the config model, the
+  example config, and the wizard-generated config.
+- New tests covering confirmation, the pending-status sidecar, write-ahead
+  intents, interrupted-save reconciliation, the single-Save rule, and
+  `--confirm-each`.
+
+### Changed
+
+- `calibrate` and `run` mark a row `DONE` only when confirmation returns
+  `CONFIRMED`. `REJECTED` and `UNKNOWN` become `RECHECK`; `UNKNOWN` reports
+  `record may already exist`.
+- Pixel comparison of pre/post screenshots is now only a weak hint in the log.
+  It can never produce `DONE`.
+- A Save clicked once is never clicked again for that row in the same run.
+  Retries cover only fill and read-back problems before the click.
+- `resume` turns any unresolved `attempting_save` row into `RECHECK` with
+  `interrupted around Save; verify in target app` and does not retry it.
+- A fresh `run` refuses to archive or restart while an unresolved save intent
+  exists; it asks for `resume` instead.
+- If a status cannot be written after Save, the outcome is queued in the
+  sidecar and the run stops before processing another row.
+
+### Fixed
+
+- Pixel-unchanged forms can no longer be classified `NOT_SAVED` (which risked
+  re-saving a duplicate) and pixel changes can no longer be classified
+  `SAVED` on their own.
+- A workbook that is locked or briefly unreadable no longer loses a saved
+  outcome; it is retried, then persisted for the next run.
+
 ## [Unreleased]
 
 ### Fixed

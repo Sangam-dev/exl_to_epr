@@ -236,6 +236,12 @@ def _generate_config(
             "min_layout_confidence": 0.6,
             "min_mapping_confidence": 0.6,
         },
+        "confirmation": {
+            "success_region": None,
+            "error_region": None,
+            "success_pattern": "",
+            "error_patterns": [],
+        },
         "safety": {
             "stop_hotkey": "alt+t",
             "pause_hotkey": "alt+p",
@@ -243,7 +249,7 @@ def _generate_config(
             "block_external_input": True,
             "max_attempts": 3,
             "action_delay_seconds": 0.15,
-            "stop_on_failure": False,
+            "stop_on_failure": True,
         },
     }
 

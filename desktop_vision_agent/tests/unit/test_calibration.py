@@ -17,11 +17,16 @@ from excel_agent.agent.calibration import (
     resolve_layout,
     values_match,
 )
+from excel_agent.agent.confirmation import (
+    CONFIRMED,
+    REJECTED,
+    UNKNOWN,
+    ConfirmationResult,
+)
+from excel_agent.agent.pending_status import load_pending_status
 from excel_agent.config import AgentConfig
 from excel_agent.excel.reader import ExcelRow
 from excel_agent.models.verification import (
-    PostSaveResponse,
-    PostSaveVerdict,
     PreSaveResponse,
     PreSaveVerdict,
 )
@@ -427,12 +432,16 @@ def test_mark_trusted_roundtrips(tmp_path: Path) -> None:
 
 
 class FakeWriter:
-    def __init__(self) -> None:
+    def __init__(self, failures: int = 0) -> None:
+        self.failures = failures
         self.calls: list[tuple[int, str, str]] = []
 
     def write_status(
         self, row_number: int, status: str, error: str = "", timestamp=None
     ) -> None:
+        if self.failures > 0:
+            self.failures -= 1
+            raise OSError("the workbook is open in Excel")
         self.calls.append((row_number, status, error))
 
 
@@ -461,18 +470,7 @@ def _pre_verdict(approved: bool, issues: tuple[str, ...] = ()) -> PreSaveVerdict
     )
 
 
-def _post_verdict(
-    approved: bool, saved: bool, issues: tuple[str, ...] = ()
-) -> PostSaveVerdict:
-    return PostSaveVerdict(
-        approved=approved,
-        saved=saved,
-        response=PostSaveResponse(approved=approved, saved=saved),
-        issues=issues,
-    )
-
-
-def _stub_desktop(monkeypatch, *, pre_verdict, post_verdict, evidence):
+def _stub_desktop(monkeypatch, *, pre_verdict, evidence):
     window = _window()
     inspection = UIAInspection(
         window=window,
@@ -480,7 +478,7 @@ def _stub_desktop(monkeypatch, *, pre_verdict, post_verdict, evidence):
         _controls={},
     )
     captures: list[Capture] = [_capture(), _capture()]
-    calls = {"pre": 0, "post": 0, "save": 0, "capture": 0}
+    calls = {"pre": 0, "save": 0, "capture": 0}
 
     def fake_capture(_window):
         index = min(calls["capture"], len(captures) - 1)
@@ -490,10 +488,6 @@ def _stub_desktop(monkeypatch, *, pre_verdict, post_verdict, evidence):
     def fake_pre(*_args, **_kwargs):
         calls["pre"] += 1
         return pre_verdict
-
-    def fake_post(*_args, **_kwargs):
-        calls["post"] += 1
-        return post_verdict
 
     def fake_save(_layout):
         calls["save"] += 1
@@ -506,13 +500,35 @@ def _stub_desktop(monkeypatch, *, pre_verdict, post_verdict, evidence):
     )
     monkeypatch.setattr(calibration, "capture_window", fake_capture)
     monkeypatch.setattr(calibration, "check_pre_save", fake_pre)
-    monkeypatch.setattr(calibration, "check_post_save", fake_post)
     monkeypatch.setattr(calibration, "_click_save", fake_save)
     monkeypatch.setattr(calibration, "_wait", lambda *a, **k: True)
     monkeypatch.setattr(
         calibration, "compare_saved_fields", lambda *a, **k: evidence
     )
     return calls
+
+
+class FakeConfirmer:
+    def __init__(self, result: ConfirmationResult) -> None:
+        self.result = result
+        self.images: list[object] = []
+        self.weak_hints: list[str] = []
+
+    def confirm(self, image, *, weak_hint: str = "") -> ConfirmationResult:
+        self.images.append(image)
+        self.weak_hints.append(weak_hint)
+        return self.result
+
+
+def _confirmation(
+    outcome: str = CONFIRMED, reason: str = "", evidence: tuple[str, ...] = ()
+) -> ConfirmationResult:
+    return ConfirmationResult(
+        outcome=outcome,
+        reason=reason,
+        evidence=evidence,
+        source="fake",
+    )
 
 
 def _row() -> ExcelRow:
@@ -528,11 +544,11 @@ def test_calibrate_row_marks_done_and_trusts_the_map(
     calls = _stub_desktop(
         monkeypatch,
         pre_verdict=_pre_verdict(True),
-        post_verdict=_post_verdict(True, True),
         evidence=SaveEvidence(unchanged=False, detail="changed"),
     )
     writer = FakeWriter()
     mapping_path = tmp_path / "mapping.json"
+    confirmer = FakeConfirmer(_confirmation(CONFIRMED, "saved banner"))
 
     result = calibrate_row(
         _row(),
@@ -541,6 +557,7 @@ def test_calibrate_row_marks_done_and_trusts_the_map(
         writer=writer,
         client=object(),
         mapping_path=mapping_path,
+        confirmation=confirmer,
         screenshot_dir=tmp_path / "shots",
     )
 
@@ -550,7 +567,7 @@ def test_calibrate_row_marks_done_and_trusts_the_map(
     assert writer.calls == [(2, "DONE", "")]
     assert calls["save"] == 1
     assert calls["pre"] == 1
-    assert calls["post"] == 1
+    assert confirmer.weak_hints == ["changed"]
     assert load_mapping(mapping_path).trusted
     assert len(result.screenshots) == 2
 
@@ -561,7 +578,6 @@ def test_calibrate_row_rechecks_when_pre_save_is_rejected(
     calls = _stub_desktop(
         monkeypatch,
         pre_verdict=_pre_verdict(False, ("the value is missing",)),
-        post_verdict=_post_verdict(True, True),
         evidence=SaveEvidence(unchanged=False),
     )
     writer = FakeWriter()
@@ -582,22 +598,21 @@ def test_calibrate_row_rechecks_when_pre_save_is_rejected(
     assert result.attempts == 2
     assert calls["save"] == 0
     assert calls["pre"] == 2
-    assert calls["post"] == 0
     assert writer.calls[0][1] == "RECHECK"
     assert "pre-save rejected" in writer.calls[0][2]
     assert not load_mapping(mapping_path).trusted
 
 
-def test_calibrate_row_does_not_retry_an_uncertain_save(
+def test_calibrate_row_does_not_retry_an_unknown_save(
     monkeypatch, tmp_path: Path
 ) -> None:
     calls = _stub_desktop(
         monkeypatch,
         pre_verdict=_pre_verdict(True),
-        post_verdict=_post_verdict(False, True, ("the evidence is ambiguous",)),
         evidence=SaveEvidence(unchanged=False, detail="changed"),
     )
     writer = FakeWriter()
+    confirmer = FakeConfirmer(_confirmation(UNKNOWN, "no success text"))
 
     result = calibrate_row(
         _row(),
@@ -606,6 +621,7 @@ def test_calibrate_row_does_not_retry_an_uncertain_save(
         writer=writer,
         client=object(),
         mapping_path=tmp_path / "mapping.json",
+        confirmation=confirmer,
         screenshot_dir=tmp_path / "shots",
     )
 
@@ -613,17 +629,46 @@ def test_calibrate_row_does_not_retry_an_uncertain_save(
     assert result.attempts == 1
     assert calls["save"] == 1
     assert calls["pre"] == 1
-    assert calls["post"] == 1
-    assert "may already exist" in writer.calls[0][2]
+    assert "record may already exist" in writer.calls[0][2]
 
 
-def test_calibrate_row_does_not_save_again_when_the_fields_are_unchanged(
+def test_calibrate_row_rejects_a_rejected_save(
     monkeypatch, tmp_path: Path
 ) -> None:
     calls = _stub_desktop(
         monkeypatch,
         pre_verdict=_pre_verdict(True),
-        post_verdict=_post_verdict(True, True),
+        evidence=SaveEvidence(unchanged=False, detail="changed"),
+    )
+    writer = FakeWriter()
+    confirmer = FakeConfirmer(
+        _confirmation(REJECTED, "error text matched 'duplicate'")
+    )
+
+    result = calibrate_row(
+        _row(),
+        config=_config(max_attempts=3),
+        mapping=_mapping(),
+        writer=writer,
+        client=object(),
+        mapping_path=tmp_path / "mapping.json",
+        confirmation=confirmer,
+        screenshot_dir=tmp_path / "shots",
+    )
+
+    assert result.status == "RECHECK"
+    assert result.attempts == 1
+    assert calls["save"] == 1
+    assert "duplicate" in writer.calls[0][2]
+    assert "may already exist" in writer.calls[0][2]
+
+
+def test_calibrate_row_confirmed_wins_even_when_the_fields_are_unchanged(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calls = _stub_desktop(
+        monkeypatch,
+        pre_verdict=_pre_verdict(True),
         evidence=SaveEvidence(
             unchanged=True,
             compared=("Invoice Number",),
@@ -639,12 +684,80 @@ def test_calibrate_row_does_not_save_again_when_the_fields_are_unchanged(
         writer=writer,
         client=object(),
         mapping_path=tmp_path / "mapping.json",
+        confirmation=FakeConfirmer(_confirmation(CONFIRMED, "saved banner")),
+        screenshot_dir=tmp_path / "shots",
+    )
+
+    assert result.status == "DONE"
+    assert result.attempts == 1
+    assert calls["save"] == 1
+    assert writer.calls == [(2, "DONE", "")]
+
+
+def test_calibrate_row_queues_done_when_the_status_write_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _stub_desktop(
+        monkeypatch,
+        pre_verdict=_pre_verdict(True),
+        evidence=SaveEvidence(unchanged=False, detail="changed"),
+    )
+    sidecar = tmp_path / "pending_status.json"
+    writer = FakeWriter(failures=99)
+
+    result = calibrate_row(
+        _row(),
+        config=_config(),
+        mapping=_mapping(),
+        writer=writer,
+        client=object(),
+        mapping_path=tmp_path / "mapping.json",
+        confirmation=FakeConfirmer(_confirmation(CONFIRMED, "saved banner")),
+        pending_status_path=sidecar,
+        status_attempts=2,
+        sleep=lambda _seconds: None,
+        screenshot_dir=tmp_path / "shots",
+    )
+
+    assert result.status == "DONE"
+    assert result.trusted
+    assert result.status_written is False
+    assert "could not be written" in result.error
+    assert writer.calls == []
+    queued = load_pending_status(sidecar)
+    assert queued is not None
+    assert queued.entries[0].row_number == 2
+    assert queued.entries[0].status == "DONE"
+
+
+def test_calibrate_row_queues_recheck_when_the_status_write_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _stub_desktop(
+        monkeypatch,
+        pre_verdict=_pre_verdict(True),
+        evidence=SaveEvidence(unchanged=False, detail="changed"),
+    )
+    sidecar = tmp_path / "pending_status.json"
+    writer = FakeWriter(failures=99)
+
+    result = calibrate_row(
+        _row(),
+        config=_config(),
+        mapping=_mapping(),
+        writer=writer,
+        client=object(),
+        mapping_path=tmp_path / "mapping.json",
+        confirmation=FakeConfirmer(_confirmation(UNKNOWN, "no success text")),
+        pending_status_path=sidecar,
+        status_attempts=2,
+        sleep=lambda _seconds: None,
         screenshot_dir=tmp_path / "shots",
     )
 
     assert result.status == "RECHECK"
-    assert result.attempts == 1
-    assert calls["save"] == 1
-    assert calls["post"] == 1
-    assert "unchanged" in writer.calls[0][2]
-    assert "may already exist" in writer.calls[0][2]
+    assert result.status_written is False
+    assert "could not be written" in result.error
+    queued = load_pending_status(sidecar)
+    assert queued is not None
+    assert queued.entries[0].status == "RECHECK"

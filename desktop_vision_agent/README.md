@@ -5,10 +5,11 @@ them into a manually opened target application. Gemini grounds the form layout
 once; deterministic Python fills the fields, verifies the save, and writes
 `DONE` / `RECHECK` back to a copy of the workbook.
 
-> **Status: Segment 9 (Hardening & release, v1.0).** Full implementation of all 10
-> segments (0 through 9): unit and integration testing (278 tests), test fixture
-> forms (WinForms and Tkinter), offline zero-cost demo runner, and comprehensive
-> fault recovery.
+> **Status: Segment 10 (hardening, v0.9.10 save confirmation).** All 10
+> segments (0 through 9) plus the save-confirmation hardening pass: unit and
+> integration testing (334 tests), test fixture forms (WinForms and Tkinter),
+> offline zero-cost demo runner, and fault recovery that never re-saves a row
+> after Save was clicked.
 
 ## Requirements
 
@@ -137,14 +138,49 @@ trusting it:
 
 It re-inspects the live window, fills the mapped fields, reads them back
 through UIA, takes a pre-save screenshot, and asks Gemini to confirm the
-values. Only then does it click Save. A post-save screenshot is compared with
-the pre-save image and sent to Gemini; the row is marked `DONE` only when both
-checks pass. Every attempt saves its screenshots to `data/screenshots/`.
+values. Only then does it click Save. After Save it reads the configured
+success/error text region and marks the row `DONE` only on explicit
+`CONFIRMED` evidence. Every attempt saves its screenshots to
+`data/screenshots/`.
 
 The mapping stays `trusted: false` until both checks pass. On failure the row
 is marked `RECHECK` and the map stays untrusted. A save that may already have
 succeeded is never retried automatically, so a failed calibration cannot
 create duplicate records. `--no-overlay` disables the status overlay.
+
+## Save confirmation
+
+`confirmation` in the config decides what counts as a successful Save:
+
+```json
+"confirmation": {
+  "success_region": { "x1": 0, "y1": 850, "x2": 1000, "y2": 950 },
+  "error_region": { "x1": 0, "y1": 850, "x2": 1000, "y2": 950 },
+  "success_pattern": "(?i)saved",
+  "error_patterns": ["(?i)required", "(?i)duplicate", "(?i)error"]
+}
+```
+
+Regions use 0-1000 normalized window coordinates. The agent crops the region
+from the post-Save screenshot and reads its text through the injectable
+`text_reader`; the only real reader in this segment is Gemini-backed. An OCR
+reader can be added later without changing the strategy.
+
+The outcome is explicit:
+
+- `CONFIRMED` - the success pattern matched: the row becomes `DONE`.
+- `REJECTED` - an error pattern matched: the row becomes `RECHECK` and is not
+  saved again.
+- `UNKNOWN` - no usable evidence: the row becomes `RECHECK` with
+  `record may already exist`, never `DONE`.
+
+Pixel comparison of the pre- and post-Save screenshots is only a **weak hint**
+in the log. It can never confirm a save. If no confirmation pattern is
+configured, every saved row is `UNKNOWN`, which fails closed to `RECHECK`.
+
+`run --confirm-each` pauses for Enter or `Y` before each Save click, so you can
+watch the first runs. Anything else stops the run before the click; the row is
+left unsaved.
 
 ## Batch run
 
@@ -153,22 +189,25 @@ create duplicate records. `--no-overlay` disables the status overlay.
 ```powershell
 ..\.venv\Scripts\python.exe main.py run --config config/agent.test.json
 ..\.venv\Scripts\python.exe main.py run --config config/agent.test.json --limit 5
+..\.venv\Scripts\python.exe main.py run --config config/agent.test.json --confirm-each
 ```
 
 `run` refuses to start while the mapping is untrusted, so calibration must pass
 first. There is no override flag.
 
-Each row is filled with the same deterministic path as calibration. The save is
-judged by comparing the non-empty mapped fields before and after Save: changed
-fields mean `DONE`, while unchanged fields are marked `RECHECK` without clicking
-Save again. Gemini is called only when the comparison cannot decide (no
-comparable field or a window-size change). A clean run therefore makes **zero
-Gemini calls per row**.
+Each row is filled with the same deterministic path as calibration. Save is
+judged only by the configured confirmation text, never by pixels and never by
+a guess. A Save clicked once is never clicked again for that row in the same
+run. Retries only cover failures before the click (fill, UIA read-back, or a
+stop), so an uncertain Save cannot create a duplicate record.
 
-A save that may already have succeeded is never retried; the row is marked
-`RECHECK` instead. Rows are written and the workbook is saved after each row, so
-stopping mid-run loses nothing. Restarting `run` skips every `DONE` and
-`RECHECK` row by default (`excel.skip_statuses`).
+By default `safety.stop_on_failure` is `true`: a non-`DONE` row stops the run
+before the next row. Set it to `false` only when you deliberately want to
+continue past `RECHECK` rows.
+
+Rows are written and the workbook is saved after each row, so stopping mid-run
+loses nothing. Restarting `run` skips every `DONE` and `RECHECK` row by default
+(`excel.skip_statuses`).
 
 The working copy is selected once and recorded in `data/state/output.json`.
 `calibrate` and `run` reuse that same copy, which is how a calibrated row is
@@ -194,6 +233,21 @@ stop:
 - the row under way is recorded as unfinished but has no workbook status, so
   resuming restarts it from scratch instead of saving it twice,
 - every finished row is recorded and never touched again.
+
+Immediately before each Save click the agent writes a **write-ahead intent**
+(`{row_number, invoice_id, state: "attempting_save", ts}`) to the run state and
+flushes it to disk. If the process dies around Save, `resume` finds that
+marker, marks the row `RECHECK` with
+`interrupted around Save; verify in target app`, and does not retry it
+automatically. A fresh `run` refuses to touch the working copy while such a
+marker is unresolved; it asks you to `resume` first.
+
+If the workbook cannot be written after Save (for example, it is open in
+Excel), the outcome is retried with backoff. If it still fails, the run stops
+with a clear message and the outcome is stored in both `run_state.json` and
+`data/state/pending_status.json`. The next `run` or `resume` replays those
+pending statuses before reading any row; it will not process a row while a
+saved outcome is still unwritten.
 
 Continue later:
 
@@ -257,21 +311,24 @@ pytest -v
 - `Ctrl+Alt+Del` is preserved at the Windows OS level as an unblockable escape.
 - The background watchdog automatically releases input hooks if the process terminates or hangs.
 
-## Implemented vs. Deferred (v1.0)
+## Implemented vs. Deferred (v0.9.10)
 
 | Feature | Status | Notes |
 |---|:---:|---|
 | Text & Number inputs | Implemented | Filled via UIA and SendInput with clipboard fallback |
 | Single Window Forms | Implemented | Native Windows applications |
 | Visual Grounding | Implemented | Google Gemini (`gemini-3.6-flash`) |
-| First-Row Calibration | Implemented | Pre-save and post-save visual verification |
-| Deterministic Batch Entry | Implemented | 0 AI calls per clean row using pixel diffs |
-| Atomic Stop & Resume | Implemented | Idempotent state persistence via `run_state.json` |
+| First-Row Calibration | Implemented | Pre-save Gemini check and post-save text confirmation |
+| Deterministic Batch Entry | Implemented | One Gemini text-region read per saved row |
+| Save Confirmation | Implemented | Config-driven success/error text; pixels are only a hint |
+| Atomic Stop & Resume | Implemented | Write-ahead save intent plus `run_state.json` |
+| Pending Status Replay | Implemented | `data/state/pending_status.json` sidecar |
 | Low-Level Safety Lock | Implemented | Windows hooks with emergency `Alt+T` release |
 | Combobox / Dropdowns | Deferred | Planned for v1.1 |
 | Checkboxes / Radios | Deferred | Planned for v1.1 |
 | Multi-tab / Wizards | Deferred | Planned for v1.1 |
 | Automatic App Launch | Deferred | User opens target window manually |
+| OCR text reader | Deferred | `TextReader` interface is ready; Gemini is the only reader |
 
 ## Layout
 
@@ -283,7 +340,7 @@ desktop_vision_agent/
 ├── tests/             # unit and integration test suites
 ├── scripts/           # test fixtures (test_form.ps1, test_form.py) and demo_offline.py
 ├── data/              # runtime input/output/screenshots/state (gitignored)
-├── docs/segments/     # per-segment notes (segments 00-09)
+├── docs/segments/     # per-segment notes (segments 00-10)
 └── legacy/            # archived experiments (not imported)
 ```
 

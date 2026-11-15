@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 import subprocess
 import time
 from typing import Generator
@@ -12,13 +13,15 @@ from excel_agent.desktop.uia import UIAError, inspect_window
 from excel_agent.desktop.window import find_window
 from excel_agent.models.screen import Rect, WindowInfo
 
+REPO_DIR = Path(__file__).resolve().parent.parent.parent
+
 
 @pytest.fixture(scope="module")
 def winforms_fixture() -> Generator[WindowInfo, None, None]:
     """Launch the WinForms test fixture for UIA testing."""
     proc = subprocess.Popen(
         ["powershell", "-STA", "-ExecutionPolicy", "Bypass", "-File", "scripts/test_form.ps1"],
-        cwd="desktop_vision_agent",
+        cwd=str(REPO_DIR),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
