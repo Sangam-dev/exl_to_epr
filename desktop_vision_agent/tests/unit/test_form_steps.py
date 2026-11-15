@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import pytest
 from PIL import Image
 
-from excel_agent.agent import form_steps
+from excel_agent.agent import form_steps, pause_guard
 from excel_agent.agent.calibration import ResolvedTarget, SaveEvidence
 from excel_agent.agent.confirmation import (
     CONFIRMED,
@@ -653,6 +653,10 @@ def test_the_plan_is_retried_only_when_configured(monkeypatch) -> None:
         problems=("step 2 (fill 'Amount'): no match",),
     )
     _stub_row(monkeypatch, plan)
+    # The app closed the form itself, so there is nothing to clean up first.
+    monkeypatch.setattr(
+        form_steps, "inspect_window", lambda _w, **_k: FakeInspection([])
+    )
     writer = FakeWriter()
 
     outcome = run_form_row(
@@ -666,6 +670,68 @@ def test_the_plan_is_retried_only_when_configured(monkeypatch) -> None:
 
     assert outcome.status == "RECHECK"
     assert outcome.attempts == 2
+
+
+def test_a_retry_is_refused_while_the_failed_form_is_still_open(
+    monkeypatch,
+) -> None:
+    plan = PlanResult(
+        inspection=FakeInspection([_button("Save", "b9")]),
+        fields={},
+        problems=("step 2 (fill 'Amount'): no match",),
+    )
+    calls = _stub_row(monkeypatch, plan)
+    writer = FakeWriter()
+
+    outcome = run_form_row(
+        _row(),
+        config=_form_config(max_attempts=3, retry_on_failure=True),
+        writer=writer,
+        confirmation=FakeConfirmer(),
+        sleep=lambda _s: None,
+        output=lambda _m: None,
+    )
+
+    assert outcome.status == "RECHECK"
+    assert outcome.attempts == 1
+    assert "still open" in outcome.error
+    # Escape was tried once, then the retry was abandoned.
+    assert calls["keys"] == [form_steps.VK_ESCAPE]
+
+
+def test_a_retry_proceeds_once_the_failed_form_is_closed(monkeypatch) -> None:
+    plan = PlanResult(
+        inspection=FakeInspection([_button("Save", "b9")]),
+        fields={},
+        problems=("step 2 (fill 'Amount'): no match",),
+    )
+    calls = _stub_row(monkeypatch, plan)
+    form_open = FakeInspection([_field("Amount"), _button("Save", "b9")])
+    form_closed = FakeInspection([])
+    # attempt 1 start, attempt 2 start, first look after the failure, then the
+    # look that confirms the form is gone.
+    replies = iter([form_open, form_open, form_open, form_closed])
+    monkeypatch.setattr(
+        form_steps,
+        "inspect_window",
+        lambda _w, **_k: next(replies, form_closed),
+    )
+    notes: list[str] = []
+    writer = FakeWriter()
+
+    outcome = run_form_row(
+        _row(),
+        config=_form_config(max_attempts=2, retry_on_failure=True),
+        writer=writer,
+        confirmation=FakeConfirmer(),
+        sleep=lambda _s: None,
+        output=notes.append,
+    )
+
+    assert outcome.attempts == 2
+    assert "still open" not in outcome.error
+    assert calls["keys"] == [form_steps.VK_ESCAPE]
+    assert "  the form was closed" in notes
 
 
 # ---------------------------------------------------------------------------
@@ -704,7 +770,7 @@ def test_a_resume_brings_the_window_back_and_reads_the_screen_again(
 
     monkeypatch.setattr(form_steps, "inspect_window", fake_inspect)
     monkeypatch.setattr(
-        form_steps, "focus_window", lambda window: focused.append(window) or True
+        pause_guard, "focus_window", lambda window: focused.append(window) or True
     )
     controller = _ResumingController(resume_on=3)
 
@@ -737,7 +803,7 @@ def test_a_pause_before_the_paste_clicks_the_field_again(monkeypatch) -> None:
     focused: list[object] = []
 
     monkeypatch.setattr(
-        form_steps, "focus_window", lambda window: focused.append(window) or True
+        pause_guard, "focus_window", lambda window: focused.append(window) or True
     )
     controller = _ResumingController(resume_on=2)
 
@@ -764,7 +830,7 @@ def test_a_pause_before_the_paste_clicks_the_field_again(monkeypatch) -> None:
 def test_a_resume_that_cannot_raise_the_window_stops_the_run(monkeypatch) -> None:
     calls = _stub_input(monkeypatch)
     inspection = FakeInspection([_field("Amount")], values={"e1": "500"})
-    monkeypatch.setattr(form_steps, "focus_window", lambda _window: False)
+    monkeypatch.setattr(pause_guard, "focus_window", lambda _window: False)
     controller = _ResumingController(resume_on=3)
 
     with pytest.raises(RunnerAborted) as excinfo:
@@ -866,7 +932,7 @@ def test_a_pause_before_save_finds_the_button_again_instead_of_clicking(
     )
     focused: list[object] = []
     monkeypatch.setattr(
-        form_steps, "focus_window", lambda window: focused.append(window) or True
+        pause_guard, "focus_window", lambda window: focused.append(window) or True
     )
     controller = _ResumingController(resume_on=2)
     writer = FakeWriter()

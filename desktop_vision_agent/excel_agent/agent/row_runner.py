@@ -59,13 +59,11 @@ logger = logging.getLogger(__name__)
 LayoutObserver = Callable[[ResolvedLayout, WindowInfo], None]
 
 
-class RunnerError(RuntimeError):
-    """The batch cannot continue safely."""
-
-
-class RunnerAborted(RunnerError):
-    """The user stopped the run before the current row was saved."""
-
+# Re-exported so existing imports (``from .row_runner import RunnerError``)
+# keep working; the classes themselves live in ``errors`` to avoid a cycle with
+# the pause guard.
+from .errors import RunnerAborted, RunnerError
+from .pause_guard import PauseGuard
 
 @dataclass(frozen=True)
 class RowOutcome:
@@ -345,6 +343,7 @@ def run_row(
         try:
             window = attach_window(config.app)
             inspection = inspect_window(window)
+            guard = PauseGuard(controller, window, output, sleep=sleep)
             layout = resolve_layout(mapping, inspection)
             for warning in layout.warnings:
                 output(f"  note: {warning}")
@@ -379,9 +378,35 @@ def run_row(
                 continue
 
             pre = capture_window(window)
-            _require_running(
-                controller, "stopped before Save; the row was not saved"
-            )
+            if guard.check("stopped before Save; the row was not saved"):
+                # The user took over while paused, so re-read the screen and
+                # find the fields and the Save button again before clicking.
+                try:
+                    inspection = inspect_window(window)
+                    layout = resolve_layout(mapping, inspection)
+                except UIAError as exc:
+                    return finish(
+                        config.excel.recheck_value,
+                        error=(
+                            "stopped while paused and the window could not be "
+                            f"read again ({exc}); the row was not saved"
+                        ),
+                        attempts=attempt,
+                        screenshots=screenshots,
+                    )
+                if layout.problems:
+                    message = (
+                        "the layout changed while the run was paused: "
+                        + "; ".join(layout.problems)
+                    )
+                    issues.append(f"attempt {attempt}: {message}")
+                    output(f"  {message}")
+                    return finish(
+                        config.excel.recheck_value,
+                        error=f"{message}; the row was not saved",
+                        attempts=attempt,
+                        screenshots=screenshots,
+                    )
 
             if confirm_each:
                 _ask_before_save(row, input_func)

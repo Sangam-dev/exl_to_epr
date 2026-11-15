@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from excel_agent.agent import row_runner
+from excel_agent.agent import pause_guard, row_runner
 from excel_agent.agent.calibration import ResolvedLayout, ResolvedTarget, SaveEvidence
 from excel_agent.agent.confirmation import (
     CONFIRMED,
@@ -215,6 +215,91 @@ def _stub_desktop(
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
+
+
+class _ResumingController:
+    """Reports a pause-and-resume on a chosen check."""
+
+    def __init__(self, resume_on: int) -> None:
+        self._resume_on = resume_on
+        self.pause_count = 0
+        self.checks = 0
+
+    def check(self) -> bool:
+        self.checks += 1
+        if self.checks >= self._resume_on:
+            self.pause_count = 1
+        return True
+
+
+def test_a_resume_before_save_reads_the_screen_again(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calls = _stub_desktop(
+        monkeypatch,
+        evidence=SaveEvidence(
+            unchanged=False,
+            compared=("Invoice Number",),
+            detail="the filled fields changed",
+        ),
+    )
+    stub_inspect = row_runner.inspect_window
+    seen: list[int] = []
+    monkeypatch.setattr(
+        row_runner,
+        "inspect_window",
+        lambda window, **kwargs: seen.append(1) or stub_inspect(window, **kwargs),
+    )
+    focused: list[object] = []
+    monkeypatch.setattr(
+        pause_guard, "focus_window", lambda window: focused.append(window) or True
+    )
+    notes: list[str] = []
+
+    result = run_row(
+        _row(),
+        config=_config(),
+        mapping=_mapping(),
+        writer=FakeWriter(),
+        client=object(),
+        confirmation=FakeConfirmer(_confirmation(CONFIRMED, "success text matched")),
+        controller=_ResumingController(resume_on=2),
+        screenshot_dir=tmp_path / "shots",
+        output=notes.append,
+    )
+
+    assert result.status == "DONE"
+    assert calls["save"] == 1
+    # Once at the start of the attempt, once more after the resume.
+    assert len(seen) == 2
+    assert len(focused) == 1
+    assert "  resumed: the window was brought back to the front" in notes
+
+
+def test_a_resume_that_cannot_raise_the_window_saves_nothing(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calls = _stub_desktop(
+        monkeypatch,
+        evidence=SaveEvidence(unchanged=False, detail="the filled fields changed"),
+    )
+    monkeypatch.setattr(pause_guard, "focus_window", lambda _window: False)
+
+    with pytest.raises(RunnerAborted) as excinfo:
+        run_row(
+            _row(),
+            config=_config(),
+            mapping=_mapping(),
+            writer=FakeWriter(),
+            client=object(),
+            confirmation=FakeConfirmer(_confirmation(CONFIRMED)),
+            controller=_ResumingController(resume_on=2),
+            screenshot_dir=tmp_path / "shots",
+            output=lambda _m: None,
+        )
+
+    assert "could not be brought back to the front" in str(excinfo.value)
+    assert calls["save"] == 0
 
 
 def test_layout_fingerprint_tracks_geometry_not_candidate_ids() -> None:

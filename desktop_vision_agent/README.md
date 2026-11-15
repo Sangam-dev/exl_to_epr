@@ -345,7 +345,21 @@ without reading the screen - set `confirmation.verifier` to `"none"`, or answer
 `[n]` to "Check the screen after each Save?" in the wizard. Nothing is read, no
 row is scrolled for, and no `RECHECK` is written; a Save that the app refuses
 will not be noticed. The first row is still checked, because that is how the
-wizard tells the plan works.
+wizard tells the plan works. The run prints a warning when it starts and logs
+`save check is off (verifier=none)`, so a later reconciliation knows the
+workbook was not verified.
+
+A row is retried only when `form.retry_on_failure` is set, and never while the
+failed attempt's form is still open: the runner presses `Esc`, re-reads the
+window, and if the form will not close it writes `RECHECK` instead. Starting
+again on top of an abandoned form would click "add" into it and enter the row
+twice, or mix one row's values with another's.
+
+Only one run can drive the application at a time. A lock file at
+`data/state/run.lock` holds the owner's pid; a second run refuses to start with
+`another run is already active (pid …)` instead of interleaving clicks and
+racing on the workbook. A lock left behind by a killed process is taken over
+automatically (the pid is checked), and the file is removed when the run ends.
 
 Setup screenshots are kept in `data/steps/<timestamp>/`. Partial fills are
 normal: a step fills only the columns it matched, and the last step that fills a
@@ -450,7 +464,9 @@ pytest -v
   minimised) and the screen is read again before the next click or fill, so the
   run does not type into whatever you left open. If you closed the form while it
   was paused, the row is written `RECHECK` instead of the Save button being
-  clicked at a remembered point on the screen.
+  clicked at a remembered point on the screen. Both `form run` and `run` use the
+  same guard, so the mapped pipeline also reads the screen again and resolves
+  the fields and Save button before it clicks.
 - Every click is verified against the live window immediately before it is
   sent: the point must still be inside the target window and land on the app
   itself (not on another application that has come in front). When it does not,
