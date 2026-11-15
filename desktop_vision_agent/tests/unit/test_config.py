@@ -121,3 +121,28 @@ def test_id_column_cannot_be_a_status_column(valid_config: dict) -> None:
 
     with pytest.raises(ValidationError, match="id_column"):
         AgentConfig.model_validate(valid_config)
+
+def test_the_save_verifier_defaults_to_reading_text() -> None:
+    from excel_agent.config import ConfirmationConfig
+
+    config = ConfirmationConfig()
+
+    assert config.verifier == "text"
+    assert config.footprint == []
+
+
+def test_a_row_verifier_keeps_a_clean_footprint() -> None:
+    from excel_agent.config import ConfirmationConfig
+
+    config = ConfirmationConfig(
+        verifier="row", footprint=[" Client ID ", "", "Client ID", "Phone"]
+    )
+
+    assert config.footprint == ["Client ID", "Phone"]
+
+
+def test_an_unknown_save_verifier_is_rejected() -> None:
+    from excel_agent.config import ConfirmationConfig
+
+    with pytest.raises(ValidationError):
+        ConfirmationConfig(verifier="vibes")

@@ -1,0 +1,66 @@
+{
+  "app": {
+    "title_contains": "Invoice Manager",
+    "process_name": null,
+    "require_foreground": true
+  },
+  "excel": {
+    "input_path": "data/input/invoices.xlsx",
+    "output_path": "data/output/invoices_agent.xlsx",
+    "sheet": "Invoices",
+    "header_row": 1,
+    "id_column": "Invoice Number",
+    "status_column": "Agent Status",
+    "timestamp_column": "Agent Timestamp",
+    "error_column": "Agent Error",
+    "done_value": "DONE",
+    "recheck_value": "RECHECK",
+    "skip_statuses": ["DONE", "RECHECK"],
+    "empty_cell_policy": "skip",
+    "required_columns": []
+  },
+  "fields": [
+    { "column": "Invoice Number", "field": "Invoice Entry", "type": "text" },
+    { "column": "Customer Name", "field": "Customer Name", "type": "text" },
+    { "column": "Amount", "field": "Amount", "type": "number" }
+  ],
+  "form": {
+    "steps": [
+      { "action": "click", "button": "Add New" },
+      { "action": "fill", "column": "Invoice Number" },
+      { "action": "fill", "column": "Customer Name" },
+      { "action": "fill", "column": "Amount" }
+    ],
+    "pause_after_click_seconds": 0.5,
+    "retry_on_failure": false
+  },
+  "actions": {
+    "save_button": "Save Record",
+    "new_record_button": null,
+    "wait_after_save_seconds": 1.5
+  },
+  "gemini": {
+    "model": "gemini-3.6-flash",
+    "max_image_dimension": 1600,
+    "timeout_seconds": 60,
+    "max_retries": 3,
+    "max_ai_calls": 50,
+    "min_layout_confidence": 0.6,
+    "min_mapping_confidence": 0.6
+  },
+  "confirmation": {
+    "success_region": { "x1": 0, "y1": 850, "x2": 1000, "y2": 950 },
+    "error_region": { "x1": 0, "y1": 850, "x2": 1000, "y2": 950 },
+    "success_pattern": "(?i)saved|success",
+    "error_patterns": ["(?i)required", "(?i)duplicate", "(?i)error"]
+  },
+  "safety": {
+    "stop_hotkey": "alt+t",
+    "pause_hotkey": "alt+p",
+    "resume_hotkey": "alt+r",
+    "block_external_input": true,
+    "max_attempts": 3,
+    "action_delay_seconds": 0.15,
+    "stop_on_failure": true
+  }
+}

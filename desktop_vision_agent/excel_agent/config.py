@@ -16,6 +16,8 @@ from typing import Literal
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .models.actions import FillStep, FormStep
+
 FieldType = Literal["text", "number"]          
 EmptyCellPolicy = Literal["skip", "clear"]
 
@@ -118,6 +120,22 @@ class ActionsConfig(BaseModel):
     wait_after_save_seconds: float = Field(default=1.5, ge=0)
 
 
+class FormConfig(BaseModel):
+    """A static click/fill plan, run once per row instead of a mapping.
+
+    The steps exist because a mapping can describe *which* field a column goes
+    into but not the *order* of work: a form that needs "Add" clicked before
+    its fields exist, or a button pressed between two fills, cannot be
+    expressed as a set of column -> field pairs.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    steps: list[FormStep] = Field(min_length=1)
+    retry_on_failure: bool = False
+    pause_after_click_seconds: float = Field(default=0.5, ge=0)
+
+
 class GeminiConfig(BaseModel):
     """Gemini model and cost guards."""
 
@@ -177,7 +195,14 @@ def _compile_pattern(value: str) -> None:
 
 
 class ConfirmationConfig(BaseModel):
-    """Where and how to read positive/negative Save evidence."""
+    """Where and how to read positive/negative Save evidence.
+
+    ``verifier`` picks the evidence: ``text`` sends the screen to the model and
+    matches ``success_pattern``; ``row`` stays local and looks for the values
+    from ``footprint`` appearing on the screen after Save, which is what apps
+    that show no success message actually offer; ``none`` checks nothing and
+    records every Save as done.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -185,6 +210,18 @@ class ConfirmationConfig(BaseModel):
     error_region: NormalizedRegion | None = None
     success_pattern: str = ""
     error_patterns: list[str] = Field(default_factory=list)
+    verifier: Literal["text", "row", "none"] = "text"
+    footprint: list[str] = Field(default_factory=list)
+
+    @field_validator("footprint")
+    @classmethod
+    def _clean_footprint(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for value in values:
+            name = str(value).strip()
+            if name and name not in cleaned:
+                cleaned.append(name)
+        return cleaned
 
     @field_validator("success_pattern")
     @classmethod
@@ -205,6 +242,23 @@ class ConfirmationConfig(BaseModel):
             _compile_pattern(value)
             cleaned.append(value)
         return cleaned
+
+
+class ScrollConfig(BaseModel):
+    """Reaching a newly saved row that landed below the fold.
+
+    Built for apps where the list scrolls while the Add button and the entry
+    form stay put: the search only moves down from the current position, and
+    nothing is scrolled back afterwards. ``enabled: false`` restores the
+    single-read behaviour, where a row below the fold is simply not seen.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    max_screens: int = Field(default=6, ge=1, le=60)
+    settle_seconds: float = Field(default=0.4, ge=0, le=5)
+    wheel_notches: int = Field(default=5, ge=1, le=50)
 
 
 class SafetyConfig(BaseModel):
@@ -248,8 +302,10 @@ class AgentConfig(BaseModel):
     excel: ExcelConfig
     fields: list[FieldConfig] = Field(default_factory=list)
     actions: ActionsConfig
+    form: FormConfig | None = None
     gemini: GeminiConfig = Field(default_factory=GeminiConfig)
     confirmation: ConfirmationConfig = Field(default_factory=ConfirmationConfig)
+    scrolling: ScrollConfig = Field(default_factory=ScrollConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
 
     @model_validator(mode="after")
@@ -276,6 +332,23 @@ class AgentConfig(BaseModel):
             )
         if self.excel.id_column.strip().upper() in reserved:
             raise ValueError("excel.id_column must not be an agent status column")
+        return self
+
+    @model_validator(mode="after")
+    def _steps_fill_declared_columns(self) -> "AgentConfig":
+        if self.form is None:
+            return self
+        declared = {item.column for item in self.fields}
+        missing = [
+            step.column
+            for step in self.form.steps
+            if isinstance(step, FillStep) and step.column not in declared
+        ]
+        if missing:
+            raise ValueError(
+                "form step(s) fill column(s) that `fields` does not declare: "
+                + ", ".join(repr(name) for name in dict.fromkeys(missing))
+            )
         return self
 
 
