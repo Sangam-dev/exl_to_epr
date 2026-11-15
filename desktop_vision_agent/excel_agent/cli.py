@@ -23,6 +23,7 @@ from pathlib import Path
 
 from . import __version__
 from .config import ConfigError, load_config, load_env, project_root, resolve_path
+from .agent.run_lock import RunLock, RunLockError
 from .logging_setup import mask_secret, setup_logging
 
 logger = logging.getLogger(__name__)
@@ -1370,11 +1371,20 @@ def run_batch(
         print(f"Preflight screenshot: {preflight.screenshot}")
         print()
 
+    lock = RunLock()
+    try:
+        lock.acquire(note=str(config_path))
+    except RunLockError as exc:
+        writer.close()
+        print(f"ERROR: {exc}")
+        return 1
+
     try:
         controller.start()
     except Exception as exc:
         controller.close()
         writer.close()
+        lock.release()
         print(f"ERROR: {exc}")
         return 1
 
@@ -1439,6 +1449,7 @@ def run_batch(
     finally:
         controller.close()
         writer.close()
+        lock.release()
         if "window" in locals() and getattr(config.app, "pin_window", True):
             from .desktop.window import pin_window
             pin_window(window.handle, False)
@@ -1585,6 +1596,16 @@ def run_form(
 
     selected = pending[:limit] if limit is not None else pending
 
+    # Two runs at once interleave their input into the same window and race on
+    # the same workbook, so a second one is refused here.
+    lock = RunLock()
+    try:
+        lock.acquire(note=str(config_path))
+    except RunLockError as exc:
+        writer.close()
+        print(f"ERROR: {exc}")
+        return 1
+
     verifier = config.confirmation.verifier
     local_check = verifier != "text"
     client = None
@@ -1666,6 +1687,7 @@ def run_form(
     except Exception as exc:
         controller.close()
         writer.close()
+        lock.release()
         print(f"ERROR: {exc}")
         return 1
 
@@ -1689,6 +1711,7 @@ def run_form(
     finally:
         controller.close()
         writer.close()
+        lock.release()
         if getattr(config.app, "pin_window", True):
             pin_window(window.handle, False)
 
