@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import win32con
+import win32gui
 from pywinauto import Desktop
 
 from ..models.screen import Rect, UIACandidate, WindowInfo
+from .window import get_window
 
 # Controls that are useful for grounding: fields, buttons, and labels.
 _INTERESTING_TYPES = {
@@ -26,9 +30,57 @@ _INTERESTING_TYPES = {
     "Text",
 }
 
+# Table rows and cells; the records a saved entry turns into.
+_DATA_ITEM_TYPES = {"DataItem", "DataGrid"}
+
 
 class UIAError(RuntimeError):
     """UI Automation could not inspect or act on the target window."""
+
+
+# Windows reports a minimized window's rectangle at this far-off-screen corner.
+_MINIMISED_COORD = -30000
+_RESTORE_DELAY = 0.25
+
+
+def _no_screen_area(rect: Rect) -> bool:
+    """True when a rectangle cannot belong to a drawn window."""
+    return (
+        rect.width <= 0
+        or rect.height <= 0
+        or rect.left <= _MINIMISED_COORD
+        or rect.top <= _MINIMISED_COORD
+    )
+
+
+def _visible_window(window: WindowInfo) -> WindowInfo:
+    """Restore a minimized target and return its current geometry.
+
+    A minimized window reports the taskbar icon's rectangle far off-screen, so
+    every control looks like it sits outside the window and gets dropped. A
+    browser also stops drawing the page while it is minimized, and its controls
+    disappear from the tree. Restoring the window keeps the control list, the
+    screenshot and the click coordinates on the same real rectangle.
+    """
+    if not win32gui.IsWindow(window.handle):
+        raise UIAError(f"window handle 0x{window.handle:X} is no longer valid")
+    if not (win32gui.IsIconic(window.handle) or _no_screen_area(window.rect)):
+        return window
+    try:
+        win32gui.ShowWindow(window.handle, win32con.SW_RESTORE)
+    except Exception as exc:
+        raise UIAError(
+            "the target window is minimized and could not be restored; "
+            f"restore it by hand and try again: {exc}"
+        ) from exc
+    time.sleep(_RESTORE_DELAY)
+    restored = get_window(window.handle)
+    if _no_screen_area(restored.rect):
+        raise UIAError(
+            "the target window is minimized, so it has no screen area to "
+            "inspect; restore it and try again"
+        )
+    return restored
 
 
 @dataclass
@@ -104,8 +156,24 @@ def _rect(value: Any) -> Rect | None:
     return Rect(left, top, right, bottom)
 
 
-def inspect_window(window: WindowInfo, max_elements: int = 300) -> UIAInspection:
-    """Inspect only the target window's UIA subtree."""
+def inspect_window(
+    window: WindowInfo,
+    max_elements: int = 300,
+    *,
+    include_data_items: bool = False,
+) -> UIAInspection:
+    """Inspect only the target window's UIA subtree.
+
+    ``include_data_items`` adds table rows and grid cells, which a browser only
+    exposes as ``DataItem``. They are noise when grounding a click but they are
+    the record a local Save check looks for, so they are opt-in.
+    """
+    window = _visible_window(window)
+    interesting = (
+        _INTERESTING_TYPES | _DATA_ITEM_TYPES
+        if include_data_items
+        else _INTERESTING_TYPES
+    )
     try:
         spec = Desktop(backend="uia").window(handle=window.handle)
         spec.wait("exists", timeout=3.0)
@@ -124,7 +192,7 @@ def inspect_window(window: WindowInfo, max_elements: int = 300) -> UIAInspection
             if not bool(getattr(info, "visible", True)):
                 continue
             control_type = str(getattr(info, "control_type", "") or "")
-            if control_type not in _INTERESTING_TYPES:
+            if control_type not in interesting:
                 continue
             bounds = _rect(getattr(info, "rectangle", None))
             if bounds is None or not bounds.intersects(window.rect):

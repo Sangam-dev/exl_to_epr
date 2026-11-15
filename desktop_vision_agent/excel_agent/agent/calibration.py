@@ -58,6 +58,7 @@ from .pending_status import (
 logger = logging.getLogger(__name__)
 
 _EDITABLE_TYPES = {"Edit", "Document", "Spinner"}
+EDITABLE_CONTROL_TYPES = frozenset(_EDITABLE_TYPES)
 
 
 class CalibrationError(RuntimeError):
@@ -176,6 +177,22 @@ def _pick_candidate(
             warning,
         )
     return None, warning
+
+
+def resolve_page_target(
+    inspection: UIAInspection,
+    *,
+    label: str,
+    control_types: set[str] | frozenset[str],
+    candidate_id: str | None = None,
+) -> tuple[ResolvedTarget | None, str | None]:
+    """Find one live control by id (when its name agrees), then by name."""
+    return _pick_candidate(
+        inspection,
+        candidate_id=candidate_id,
+        label=label,
+        control_types=set(control_types),
+    )
 
 
 def resolve_layout(
