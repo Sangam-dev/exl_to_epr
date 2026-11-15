@@ -50,6 +50,7 @@ class SafetyController:
         self._actions: queue.Queue[str] = queue.Queue()
         self._state = SafetyState.IDLE
         self._reason = ""
+        self._pause_count = 0
         self._condition = threading.Condition()
         self._worker: threading.Thread | None = None
         self._worker_stop = threading.Event()
@@ -87,6 +88,11 @@ class SafetyController:
         return self._reason
 
     @property
+    def pause_count(self) -> int:
+        """How many pauses have happened; a change means the run was resumed."""
+        return self._pause_count
+
+    @property
     def hotkeys(self):
         return self._hotkeys
 
@@ -111,6 +117,7 @@ class SafetyController:
         """Release input while keeping the shortcut hook alive."""
         if self._state is not SafetyState.RUNNING:
             return
+        self._pause_count += 1
         self._lock.set_blocking(False)
         self._overlay.update("paused")
         self._set_state(SafetyState.PAUSED, "paused")

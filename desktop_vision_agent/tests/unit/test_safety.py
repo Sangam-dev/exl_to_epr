@@ -260,6 +260,25 @@ def test_controller_start_pause_resume_stop() -> None:
     controller.close()
 
 
+def test_every_pause_is_counted_so_a_resume_can_be_seen() -> None:
+    controller, _lock, _overlay, _watchdog = _controller()
+    controller.start()
+    assert controller.pause_count == 0
+
+    controller.pause()
+    controller.resume()
+    assert controller.pause_count == 1
+
+    controller.pause()
+    controller.resume()
+    assert controller.pause_count == 2
+
+    # Resuming without a pause before it is not a new pause.
+    controller.resume()
+    assert controller.pause_count == 2
+    controller.close()
+
+
 def test_check_returns_false_after_stop() -> None:
     controller, _lock, _overlay, _watchdog = _controller()
 

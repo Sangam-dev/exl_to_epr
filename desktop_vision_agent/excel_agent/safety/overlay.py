@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import threading
 
+from ..desktop.topmost import keep_above_topmost
+
 logger = logging.getLogger(__name__)
 
 
@@ -90,6 +92,9 @@ class StatusOverlay:
 
             screen_width = root.winfo_screenwidth()
             root.geometry(f"400x40+{max(0, screen_width - 420)}+12")
+            # The app we automate can be pinned on top too, so the topmost flag
+            # alone is not enough: keep winning the band back, without focus.
+            keep_above_topmost(root)
             self._ready.set()
             root.after(100, self._poll)
             root.mainloop()
