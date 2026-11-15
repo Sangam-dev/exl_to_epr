@@ -9,8 +9,12 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wintypes
 import time
+from typing import Any
 
 import pyperclip
+
+from .points import point_owned_by
+from .window import is_foreground
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 
@@ -192,6 +196,33 @@ def paste_text(text: str) -> None:
     # Give the clipboard a moment to settle before the target reads it.
     time.sleep(0.05)
     press_chord(VK_CONTROL, VK_V)
+
+
+def click_checked(
+    x: int,
+    y: int,
+    window: Any,
+    *,
+    require_foreground: bool = False,
+    button: str = "left",
+) -> None:
+    """Click a point only while it still belongs to the target window.
+
+    A coordinate read from a UI Automation snapshot goes stale as soon as the
+    user moves, covers, or minimises the window - and the mouse event would be
+    delivered to whatever is under the point instead. Nothing is sent when the
+    check fails, so a stale coordinate can never click another application.
+    """
+    if not point_owned_by(window, x, y):
+        raise InputError(
+            f"nothing was clicked: ({x}, {y}) is not over {window.title!r} "
+            "any more - the window moved, was covered, or was minimised"
+        )
+    if require_foreground and not is_foreground(window.handle):
+        raise InputError(
+            f"nothing was clicked: {window.title!r} is not in the foreground"
+        )
+    click(x, y, button)
 
 
 def click(x: int, y: int, button: str = "left") -> None:
