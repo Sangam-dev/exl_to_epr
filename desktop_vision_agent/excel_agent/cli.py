@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import logging
 import os
 import platform
 import sys
@@ -23,6 +24,8 @@ from pathlib import Path
 from . import __version__
 from .config import ConfigError, load_config, load_env, project_root, resolve_path
 from .logging_setup import mask_secret, setup_logging
+
+logger = logging.getLogger(__name__)
 
 _REQUIRED_MODULES = (    ("pydantic", "configuration models"),
     ("dotenv", "environment loading"),
@@ -418,6 +421,26 @@ def run_safety_test(
     controller.close()
     print(f"Input released ({reason}).")
     return 0
+
+
+def _state_printer(labels: dict[str, str]):
+    """Print what the safety hotkeys did, so the console shows the state."""
+    from .safety.controller import SafetyState
+
+    started = False
+
+    def report(state, reason: str) -> None:
+        nonlocal started
+        if state is SafetyState.PAUSED:
+            print(f"  paused - press {labels['resume']} to continue")
+        elif state is SafetyState.RUNNING:
+            if started:
+                print("  resumed - continuing")
+            started = True
+        elif state is SafetyState.STOPPED:
+            print(f"  stopped ({reason})")
+
+    return report
 
 
 def _open_target(config):
@@ -1459,6 +1482,244 @@ def run_batch(
     return 0 if recheck == 0 else 1
 
 
+def run_form(
+    config_path: str,
+    *,
+    limit: int | None = None,
+    confirm_each: bool = False,
+    overlay: bool = True,
+    env_path: str | None = None,
+) -> int:
+    """Fill a static form with a config-declared step plan (no mapping)."""
+    from .agent.confirmation import GeminiTextReader, TextConfirmation
+    from .agent.form_steps import run_form_rows
+    from .agent.row_evidence import footprint_columns
+    from .agent.pending_status import (
+        DEFAULT_PENDING_STATUS,
+        PendingStatusError,
+        apply_pending_statuses,
+    )
+    from .agent.row_runner import RunnerError
+    from .agent.workspace import WorkspaceError, open_workspace
+    from .ai.client import GeminiClient, GeminiError
+    from .desktop.capture import CaptureError
+    from .desktop.uia import UIAError
+    from .desktop.window import WindowError, attach_window, pin_window
+    from .excel.reader import (
+        ExcelReadError,
+        pending_rows,
+        read_workbook,
+        validate_pending_rows,
+    )
+    from .excel.writer import ExcelWriteError, WorkbookWriter
+    from .safety.controller import SafetyController
+    from .safety.hotkeys import HotkeyError, hotkeys_from_config
+    from .safety.overlay import NullOverlay, StatusOverlay
+
+    load_env(env_path)
+
+    try:
+        config = load_config(config_path)
+    except ConfigError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    if config.form is None or not config.form.steps:
+        print(
+            "ERROR: this config has no form.steps. `form run` fills a static "
+            "form from config; for a grounded mapping use `run`."
+        )
+        return 1
+
+    try:
+        workspace = open_workspace(config)
+        writer = WorkbookWriter.from_config(config, path=workspace.path)
+    except (ExcelWriteError, WorkspaceError) as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    try:
+        applied, remaining = apply_pending_statuses(
+            writer.write_status, path=DEFAULT_PENDING_STATUS
+        )
+    except PendingStatusError as exc:
+        writer.close()
+        print(f"ERROR: {exc}")
+        return 1
+    if remaining:
+        writer.close()
+        print(
+            f"ERROR: {len(remaining)} saved outcome(s) still could not be "
+            f"written to the workbook; see {DEFAULT_PENDING_STATUS}. Fix "
+            "workbook access and run again before processing any row."
+        )
+        for entry in remaining:
+            print(f"  row {entry.row_number}: {entry.status} - {entry.error}")
+        return 1
+    if applied:
+        print(
+            f"Applied {len(applied)} pending status(es): "
+            + ", ".join(str(number) for number in applied)
+        )
+
+    try:
+        workbook = read_workbook(config, workspace.path)
+    except (ExcelReadError, ExcelWriteError) as exc:
+        writer.close()
+        print(f"ERROR: {exc}")
+        return 1
+
+    pending = pending_rows(workbook, config)
+    issues = validate_pending_rows(pending, config)
+    if issues:
+        writer.close()
+        print(f"ERROR: {len(issues)} validation issue(s); nothing was processed:")
+        for issue in issues:
+            print(f"  - {issue}")
+        return 1
+    if not pending:
+        writer.close()
+        print(f"Working copy: {workspace.path}")
+        print("No pending rows; nothing to run.")
+        return 0
+
+    selected = pending[:limit] if limit is not None else pending
+
+    verifier = config.confirmation.verifier
+    local_check = verifier != "text"
+    client = None
+    try:
+        window = attach_window(config.app)
+        if local_check:
+            # Neither the local check nor "no check" needs a model or a key.
+            confirmation = None
+        else:
+            client = GeminiClient(config.gemini)
+            confirmation = TextConfirmation(
+                config.confirmation, GeminiTextReader(client)
+            )
+        hotkeys = hotkeys_from_config(config.safety)
+    except (
+        WindowError,
+        CaptureError,
+        UIAError,
+        GeminiError,
+        HotkeyError,
+    ) as exc:
+        writer.close()
+        print(f"ERROR: {exc}")
+        return 1
+
+    labels = {hotkey.action: hotkey.label for hotkey in hotkeys}
+    controller = SafetyController(
+        config.safety,
+        overlay=StatusOverlay(labels) if overlay else NullOverlay(),
+        on_state=_state_printer(labels),
+    )
+
+    print(f"Workbook: {workbook.path}")
+    print(f"Pending rows: {len(pending)}; processing: {len(selected)}")
+    print(
+        f"Step plan: {len(config.form.steps)} step(s), "
+        f"{len(config.fields)} declared column(s)"
+    )
+    print(f"Window: 0x{window.handle:X} {window.title!r}")
+    print(
+        f"Output copy: {workspace.path} "
+        f"({'reused' if not workspace.created else 'new'})"
+    )
+    logger.info(
+        "form run: config=%s window=%r pending=%s selected=%s verifier=%s "
+        "workspace=%s steps=%s",
+        config_path,
+        window.title,
+        len(pending),
+        len(selected),
+        verifier,
+        workspace.path,
+        len(config.form.steps),
+    )
+    if verifier == "none":
+        print(
+            "Save check: none - the screen is not read after Save and every "
+            "row is recorded as done"
+        )
+    elif local_check:
+        print(
+            "Save check: local window text "
+            f"(looks for {', '.join(repr(name) for name in footprint_columns(config))} "
+            "after Save; no AI calls)"
+        )
+    else:
+        print(
+            f"Gemini: {config.gemini.model} "
+            "(reads the confirmation text region after Save)"
+        )
+    print(
+        f"  {labels['stop']} stop | {labels['pause']} pause | "
+        f"{labels['resume']} resume"
+    )
+    print()
+
+    try:
+        controller.start()
+    except Exception as exc:
+        controller.close()
+        writer.close()
+        print(f"ERROR: {exc}")
+        return 1
+
+    try:
+        result = run_form_rows(
+            selected,
+            config=config,
+            writer=writer,
+            confirmation=confirmation,
+            controller=controller,
+            confirm_each=confirm_each,
+            pending_status_path=DEFAULT_PENDING_STATUS,
+        )
+    except RunnerError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        controller.stop(reason="interrupted")
+        print("Interrupted; rows already written as DONE are skipped next run.")
+        return 1
+    finally:
+        controller.close()
+        writer.close()
+        if getattr(config.app, "pin_window", True):
+            pin_window(window.handle, False)
+
+    print()
+    done = result.count(config.excel.done_value)
+    recheck = result.count(config.excel.recheck_value)
+    print(
+        f"Processed {result.processed} row(s): "
+        f"{done} {config.excel.done_value}, "
+        f"{recheck} {config.excel.recheck_value}"
+    )
+    for outcome in result.outcomes:
+        line = (
+            f"Row {outcome.row_number}: {outcome.status} "
+            f"(attempt {outcome.attempts})"
+        )
+        if outcome.error:
+            line += f" - {outcome.error}"
+        print(line)
+        for path in outcome.screenshots:
+            print(f"  screenshot: {path}")
+    if result.stopped:
+        print(f"Stopped at row {result.stopped_row}: {result.stop_reason}")
+    print(f"AI calls: {0 if local_check else client.calls}")
+    print(f"Output workbook: {writer.path}")
+
+    if result.stopped:
+        return 1
+    return 0 if recheck == 0 else 1
+
+
 def run_resume(
     config_path: str,
     *,
@@ -1493,6 +1754,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--agent",
         action="store_true",
         help="interactive AI assistant wizard to guide setup, calibration, and automation",
+    )
+    parser.add_argument(
+        "--agent-ui",
+        action="store_true",
+        help=(
+            "same wizard as --agent, in a floating chat window so the terminal "
+            "does not cover your application"
+        ),
     )
     parser.add_argument(
         "--config",
@@ -1658,6 +1927,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not show the status overlay",
     )
 
+    form_parser = subparsers.add_parser(
+        "form",
+        help="fill a static form described by config steps (no mapping)",
+    )
+    form_parser.add_argument("--config", default=argparse.SUPPRESS)
+    form_parser.add_argument("--env-file", default=argparse.SUPPRESS)
+    form_sub = form_parser.add_subparsers(dest="form_command")
+    form_run_parser = form_sub.add_parser(
+        "run", help="process pending rows with the step plan"
+    )
+    form_run_parser.add_argument("--config", default=argparse.SUPPRESS)
+    form_run_parser.add_argument("--env-file", default=argparse.SUPPRESS)
+    form_run_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="process at most N pending rows (default: all)",
+    )
+    form_run_parser.add_argument(
+        "--no-overlay",
+        action="store_true",
+        help="do not show the status overlay",
+    )
+    form_run_parser.add_argument(
+        "--confirm-each",
+        action="store_true",
+        help="pause for Enter/Y before every Save click",
+    )
+
     agent_parser = subparsers.add_parser(
         "agent", help="interactive AI assistant wizard to guide setup, calibration, and automation"
     )
@@ -1670,6 +1968,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    logger.info(
+        "excel-agent %s starting: %s", __version__, " ".join(argv or sys.argv[1:])
+    )
 
     if args.version:
         print(f"excel-desktop-agent {__version__}")
@@ -1677,6 +1978,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         return run_check(args.config, args.env_file)
+
+    if getattr(args, "agent_ui", False):
+        from .agent.chat_ui import run_agent_chat
+
+        return run_agent_chat(
+            config_path=getattr(args, "config", None),
+            env_path=getattr(args, "env_file", None),
+        )
 
     if getattr(args, "agent", False) or args.command == "agent":
         from .agent.wizard import run_wizard
@@ -1746,6 +2055,21 @@ def main(argv: list[str] | None = None) -> int:
             state_path=args.state,
             confirm_each=args.confirm_each,
         )
+
+    if args.command == "form":
+        if getattr(args, "form_command", None) == "run":
+            return run_form(
+                args.config,
+                limit=args.limit,
+                confirm_each=args.confirm_each,
+                overlay=not args.no_overlay,
+                env_path=args.env_file,
+            )
+        print(
+            "usage: python main.py form run [--config PATH] [--limit N] "
+            "[--confirm-each] [--no-overlay]"
+        )
+        return 2
 
     if args.command == "resume":
         return run_resume(

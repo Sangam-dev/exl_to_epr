@@ -18,6 +18,7 @@ data/annotated/*
 data/logs/*
 data/grounding/*
 data/setup/*
+data/steps/*
 !data/**/.gitkeep
 
 # Logs
@@ -25,4 +26,5 @@ data/setup/*
 
 # Interactive wizard generated configs
 config/agent.interactive.json
+config/agent.interactive.steps.json
 config/agent.run*.json

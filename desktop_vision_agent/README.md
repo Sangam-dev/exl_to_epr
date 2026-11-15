@@ -44,6 +44,7 @@ API key.
 | Command | Status |
 |---|---|
 | `python main.py --agent` | Interactive AI Assistant Wizard |
+| `python main.py --agent-ui` | The same wizard in a floating chat window |
 | `python main.py --check` | Implemented (Segment 0) |
 | `python main.py --version` | Implemented (Segment 0) |
 | `python main.py excel inspect` | Implemented (Segment 1) |
@@ -53,6 +54,7 @@ API key.
 | `python main.py setup` | Implemented (Segment 5) |
 | `python main.py calibrate` | Implemented (Segment 6) |
 | `python main.py run` | Implemented (Segment 7) |
+| `python main.py form run` | Implemented (static step plan, no mapping) |
 | `python main.py resume` | Implemented (Segment 8) |
 
 ## Interactive Agent Wizard (`--agent`)
@@ -66,10 +68,37 @@ The easiest way to run the agent on your own custom application and Excel file:
 The interactive wizard:
 1. Lists open windows and lets you pick or search for your application.
 2. Asks for your Excel file path, verifies sheets, and detects column headers.
-3. Automatically generates a tailored configuration file.
-4. Executes visual layout grounding with Gemini and gets your approval.
-5. Runs first-row calibration to earn trust for the mapping.
+3. Asks **single step** (AI mapping + calibration) or **multi step** (you
+   describe each step in your own words).
+4. Single step: generates a tailored configuration, grounds the layout with
+   Gemini, gets your approval, then calibrates on the first row.
+5. Multi step: resolves each step you describe, shows you what it understood,
+   does it live on the first row, then saves that row when you start automation.
 6. Prompts *"Do you want to start automation?"* and begins batch processing on your go.
+
+## Floating Chat Window (`--agent-ui`)
+
+The terminal wizard needs the terminal in front of you - and it covers the app
+the agent has to look at. This runs the exact same wizard in a small window
+that floats over the corner of your screen:
+
+```powershell
+..\.venv\Scripts\python.exe main.py --agent-ui
+```
+
+- Drag it by the title bar; `▾` collapses it to a strip, `◑` cycles opacity,
+  `✕` closes it.
+- It never takes over your app's window: answers go in the text box at the
+  bottom (Enter or **Send**), and a blank answer means "accept the default".
+- Every line the terminal wizard would print appears in the window, and the
+  terminal keeps its own copy of the log.
+- While automation is running, `✕` waits for it to finish; stop it with `Alt+T`.
+- Chat mode never pauses before each Save, because confirming in the window
+  would move focus off your app right before the click. Use
+  `python main.py form run --confirm-each` in a terminal when you want to
+  approve each save by hand.
+
+If `tkinter` is unavailable, `--agent-ui` falls back to the terminal wizard.
 
 ## Safety
 
@@ -217,6 +246,113 @@ start rather than silently copying the input again, because that would lose
 every status and risk duplicate records. `--no-overlay` disables the status
 overlay.
 
+## Static form mode (`form run`)
+
+`run` needs a grounded, calibrated mapping, and a mapping can express *which*
+field a column goes into but not the *order* of work. `form run` covers the
+smaller case: a form whose controls you can name in the config, where the only
+thing that matters is the sequence — click "Add" to open the entry fields, type
+three text boxes, click Save.
+
+```powershell
+..\.venv\Scripts\python.exe main.py form run --config config/agent.steps.example.json --limit 5
+```
+
+To build this config without editing JSON, run `python main.py --agent` and
+choose **2. Multi step**: describe each step in your words and the wizard turns
+it into the plan below (see "Multi-step mode").
+
+Add a `form` block to the config (see `config/agent.steps.example.json`):
+
+```json
+"form": {
+  "steps": [
+    { "action": "click", "button": "Add New" },
+    { "action": "fill", "column": "Invoice Number" },
+    { "action": "fill", "column": "Amount" },
+    { "action": "click", "button": "Save Record" }
+  ]
+}
+```
+
+There are only two actions: `click` a button and `fill` a text field. A `fill`
+uses the label from `fields` for its column; add `"field": "Other Label"` to a
+step when the same column has to go into a differently named control. Every
+fill step's column must be declared in `fields`, and `optional: true` on a step
+turns a missing control into a note instead of a failure.
+
+How it behaves:
+
+- Targets are matched by UIA name in the live window, so the labels in the
+  config must match what the application reports.
+- The window is re-read after every click, so controls that the click created
+  are found by the steps that follow it.
+- Every fill is read back before Save. A mismatch is a `RECHECK`, not a retry,
+  unless `form.retry_on_failure` is set.
+- Save is clicked once and judged either by the configured confirmation text
+  (`confirmation.verifier: "text"`) or, for apps that show no message, by the
+  saved values appearing on screen (`"row"`: local, no AI call). A row that
+  cannot be confirmed is `RECHECK`, never re-saved.
+- No mapping, no calibration, no run state: rows marked `DONE` in the workbook
+  are skipped, and that is the only progress record.
+
+Not supported in this mode yet: dropdowns, date pickers, grids, and resume
+after a stop. Use the mapped pipeline for forms that need those.
+
+## Multi-step mode (`--agent`, choice 2)
+
+The plan above has to be written as `click`/`fill` steps. Multi-step mode lets
+you describe the work instead, and proves every step on the first row before
+any batch run:
+
+1. **Add a step.** Type an instruction in your own words ("click Add New",
+   "fill up all the form"). The agent screenshots the window and asks Gemini
+   once to turn that sentence into clicks and fills.
+2. **Approve it.** It shows what it understood - which button, or which column
+   goes into which field - and you answer with Enter (do it now), `r` (look at
+   the screen again), or a correction in your own words ("the amount goes in
+   Total, not Country").
+3. **Watch it run.** Approved steps are performed at once, in order, on the
+   first pending row. Every fill is read back, so a box that did not take the
+   text is reported before the next step.
+4. **Start automation.** The wizard writes `config/agent.interactive.steps.json`,
+   clicks Save for the row you just filled, and records its status. It then asks
+   whether the later saves should be checked at all - `[y]` checks each one,
+   `[n]` fills and saves every row without looking at the screen - and, when
+   checking, whether Gemini should read the screen after every Save or the new
+   row should be found locally with no AI call. Finally it asks how many rows to
+   process. Later rows replay the stored plan without asking anything.
+
+The value that proves a save is decided from the row you just saved: whichever
+column's value appeared on screen after it. If the screen shows nothing new, the
+model is asked once, and the ID column is the last resort. With
+`"verifier": "row"` the check stays local - the window is re-read after the
+click and the row counts as saved when a value from `confirmation.footprint`
+shows up more often than before and no form field still holds it. Text matched
+by `confirmation.error_patterns` still rejects a save. Nothing is sent anywhere.
+
+When the new row lands below the fold the local check scrolls down to look for
+it, one screen at a time, and never scrolls back up - the Add button and the
+form are expected to stay where they are. If the Add button itself scrolls away
+the page scrolls as a whole, which this does not support yet: the run stops on
+the row it was checking instead of clicking a button that is no longer there.
+Tune it with `"scrolling": {"enabled": true, "max_screens": 6,
+"settle_seconds": 0.4, "wheel_notches": 5}`; `"enabled": false` reads the
+screen once, as before.
+
+To skip the check altogether - fill and save every row and mark it `DONE`
+without reading the screen - set `confirmation.verifier` to `"none"`, or answer
+`[n]` to "Check the screen after each Save?" in the wizard. Nothing is read, no
+row is scrolled for, and no `RECHECK` is written; a Save that the app refuses
+will not be noticed. The first row is still checked, because that is how the
+wizard tells the plan works.
+
+Setup screenshots are kept in `data/steps/<timestamp>/`. Partial fills are
+normal: a step fills only the columns it matched, and the last step that fills a
+column wins. A step is never left unresolved - it is done, redone, or fixed by
+your correction. Save is not a step you write; it is the final action.
+Dropdowns, selects, and date pickers are still out of scope.
+
 ## Stop and resume
 
 `run` records its progress in `data/state/run_state.json` when it starts and
@@ -308,6 +444,21 @@ pytest -v
 ### 3. Emergency Input Release
 - If the agent blocks your mouse/keyboard and you need immediate control: press **`Alt+T`**.
 - To temporarily pause execution: press **`Alt+P`** (and **`Alt+R`** to resume).
+  The console prints `paused - press Alt+R to continue` and `resumed - continuing`.
+  A pause takes effect between actions, never in the middle of typing a field;
+  on resume the target window is brought back to the front (restored if it was
+  minimised) and the screen is read again before the next click or fill, so the
+  run does not type into whatever you left open. If you closed the form while it
+  was paused, the row is written `RECHECK` instead of the Save button being
+  clicked at a remembered point on the screen.
+- Every click is verified against the live window immediately before it is
+  sent: the point must still be inside the target window and land on the app
+  itself (not on another application that has come in front). When it does not,
+  nothing is clicked and the row stops with *"nothing was clicked: … is not over
+  … any more"* — a stale coordinate can never click another window.
+- A field whose first read-back disagrees is read once more after 150 ms before
+  the row is failed, because a browser applies a paste a moment after the
+  keystroke.
 - `Ctrl+Alt+Del` is preserved at the Windows OS level as an unblockable escape.
 - The background watchdog automatically releases input hooks if the process terminates or hangs.
 
