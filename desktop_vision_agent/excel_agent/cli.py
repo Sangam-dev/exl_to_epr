@@ -1665,6 +1665,16 @@ def run_form(
             "Save check: none - the screen is not read after Save and every "
             "row is recorded as done"
         )
+        print(
+            "  WARNING: a Save the app refuses will still be recorded as "
+            f"{config.excel.done_value}. Reconciliation against the app is "
+            "yours; the log at data/logs/agent.log lists every row."
+        )
+        logger.warning(
+            "save check is off (verifier=none): every row is recorded as %s "
+            "without evidence",
+            config.excel.done_value,
+        )
     elif local_check:
         print(
             "Save check: local window text "
