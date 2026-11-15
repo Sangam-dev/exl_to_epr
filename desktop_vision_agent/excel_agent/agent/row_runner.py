@@ -22,7 +22,7 @@ from ..ai.client import GeminiClient
 from ..ai.mapping import ApprovedMapping
 from ..config import AgentConfig, project_root
 from ..desktop.capture import Capture, CaptureError, capture_window
-from ..desktop.input import InputError, click
+from ..desktop.input import InputError, click_checked
 from ..desktop.uia import UIAError, inspect_window
 from ..desktop.window import WindowError, attach_window
 from ..excel.reader import ExcelRow, format_value
@@ -130,11 +130,18 @@ def _wait(controller: SafetyController | None, seconds: float) -> bool:
     return True
 
 
-def _click_save(layout: ResolvedLayout) -> None:
+def _click_save(
+    layout: ResolvedLayout,
+    window: WindowInfo | None = None,
+    *,
+    require_foreground: bool = True,
+) -> None:
     if layout.save is None:
         raise RunnerError("the Save button could not be resolved")
     x, y = layout.save.rect.center
-    click(x, y)
+    if window is None:  # pragma: no cover - callers pass the live window
+        raise RunnerError("the Save button cannot be clicked without a window")
+    click_checked(x, y, window, require_foreground=require_foreground)
 
 
 def _screenshot(
@@ -380,7 +387,11 @@ def run_row(
                 _ask_before_save(row, input_func)
             if on_before_save is not None:
                 on_before_save(row)
-            _click_save(layout)
+            _click_save(
+                layout,
+                window,
+                require_foreground=config.app.require_foreground,
+            )
             saved = True
 
             if not _wait(controller, config.actions.wait_after_save_seconds):

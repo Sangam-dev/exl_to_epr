@@ -193,7 +193,7 @@ def _stub_desktop(
         calls["capture"] += 1
         return captures[index]
 
-    def fake_save(_layout):
+    def fake_save(_layout, _window=None, **_kwargs):
         calls["save"] += 1
         if on_save is not None:
             on_save()
