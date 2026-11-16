@@ -3,6 +3,25 @@
 All notable changes to this project are recorded here. One entry per tagged
 segment.
 
+## [Unreleased]
+
+### Added
+
+- `python main.py clear-data`: deletes runtime data left by previous runs per
+  category (`--scrn`/`--screenshots`, `--ai-logs`, `--logs`, `--output`,
+  `--state`, `--mapping`, `--input`, `--backup`, `--cache`, `--configs`) or all
+  at once with `--all`. Every run previews counts and sizes and asks for
+  confirmation; `--dry-run` only previews, `--yes` skips the prompt, and
+  `--force` overrides the queued-status and live-lock guards.
+- `agent/cleanup.py`: side-effect-free plan builder and executor. Keeps
+  `.gitkeep`, prunes only emptied folders, refuses paths outside the project,
+  empties a log file that is still open, and reports locked files as skipped.
+- `clear-data --output` also removes the `data/state/output.json` pointer so the
+  next run recopies the input instead of failing on a missing working copy.
+- `tests/unit/test_cli_clear_data.py` covering category selection, `--all`
+  exclusions, dry runs, prompts, the state guards, log truncation, and the
+  path guard.
+
 ## [v0.9.10-save-confirmation] - 2026-11-13
 
 ### Added

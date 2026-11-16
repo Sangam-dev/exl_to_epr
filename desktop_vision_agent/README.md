@@ -1,268 +1,334 @@
 # Excel Desktop Agent
 
-AI-first Windows desktop agent that reads rows from an Excel workbook and enters
-them into a manually opened target application. Gemini grounds the form layout
-once; deterministic Python fills the fields, verifies the save, and writes
-`DONE` / `RECHECK` back to a copy of the workbook.
+An AI-first Windows desktop agent that takes rows out of an Excel workbook and
+types them into an application you already have open — an invoicing tool, a CRM,
+a legacy WinForms form, a browser window. It reads the screen once with Gemini
+to learn where the fields are, then fills every row with deterministic Python,
+verifies each save, and writes `DONE` / `RECHECK` back into a **copy** of the
+workbook.
 
-> **Status: Segment 10 (hardening, v0.9.10 save confirmation).** All 10
-> segments (0 through 9) plus the save-confirmation hardening pass: unit and
-> integration testing (334 tests), test fixture forms (WinForms and Tkinter),
-> offline zero-cost demo runner, and fault recovery that never re-saves a row
-> after Save was clicked.
+**The design in one line:** Gemini is the brain (it reads the screen and plans),
+Python is the hands and the guardrails (it clicks, types, checks, and records).
+
+You never edit your original workbook, and the agent never guesses that a save
+worked — a row is only marked `DONE` on positive evidence.
+
+> **Status:** v1.0.0. 10 build segments plus hardening (save confirmation,
+> crash recovery, run locking, data cleanup). 515 unit tests and 7 integration
+> tests.
+
+---
+
+## Contents
+
+- [Who this is for](#who-this-is-for)
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Verify the install](#verify-the-install)
+- [Your first run (10 minutes, safe)](#your-first-run-10-minutes-safe)
+- [Three ways to use it](#three-ways-to-use-it)
+- [Commands](#commands)
+- [How your data is stored](#how-your-data-is-stored)
+- [Configuration](#configuration)
+- [Safety, stopping and recovering](#safety-stopping-and-recovering)
+- [AI usage and cost](#ai-usage-and-cost)
+- [Testing and the offline demo](#testing-and-the-offline-demo)
+- [Troubleshooting](#troubleshooting)
+- [Implemented vs. not supported yet](#implemented-vs-not-supported-yet)
+- [Project layout](#project-layout)
+- [FAQ](#faq)
+
+---
+
+## Who this is for
+
+Anyone who has a spreadsheet full of records and a business application with no
+API — the kind where someone would otherwise retype the same 200 rows. You need
+to be comfortable with a terminal for setup, but once configured you run the
+wizard and press a key.
+
+It is **not** a web scraper, a cloud service, or a RPA suite. It is one Python
+program on one Windows machine acting on a window you opened yourself.
+
+---
+
+## How it works
+
+```text
+  Excel workbook (read-only input)
+            |
+            |  copy once
+            v
+  working copy  --->  status columns written back after every row
+            |
+   1. Ground   : one screenshot + UIA control list + your Excel headers
+                 -> Gemini returns field positions and buttons
+   2. Map      : column <-> form field, validated, approved by you
+   3. Calibrate: fill row 1, read it back, ask Gemini to confirm the values,
+                 click Save, then read the success region
+   4. Run      : every remaining row uses the same deterministic path;
+                 one Gemini text read per saved row (or none, if configured)
+   5. Record   : DONE / RECHECK + timestamp + error text in the working copy
+```
+
+Three properties come out of that split:
+
+- **Cheap at scale.** The model is called once per layout, not once per field or
+  per row. A 200-row batch costs one grounding call plus one confirmation read
+  per saved row (and that can be set to zero).
+- **Predictable.** Clicking and typing are pure Python. The same mapping always
+  produces the same actions.
+- **Fail-closed.** If a save cannot be proven, the row becomes `RECHECK`, is
+  never re-saved, and the run stops by default.
+
+There are two pipelines, and they answer different questions:
+
+|                  | Mapped pipeline (`setup` → `calibrate` → `run`) | Step pipeline (`form run`)               |
+| ---------------- | ------------------------------------------------------- | ------------------------------------------ |
+| Question         | *Which field does each column go into?*               | *In what order do I click and type?*     |
+| Needs Gemini     | Yes, for grounding                                      | Only if you verify saves with text         |
+| Stores a mapping | Yes, `data/state/mapping.json`                        | No, the plan is inline in the config       |
+| Order of actions | Derived from the grounded field map                     | Literal list of `click` / `fill` steps |
+| Good for         | One screen, many inputs                                 | Add → fill → Save forms                  |
+
+---
 
 ## Requirements
 
-- Windows 11
-- Python 3.11+ (tested with 3.12.2)
-- A Gemini API key
+|            |                                                                      |
+| ---------- | -------------------------------------------------------------------- |
+| OS         | Windows 11 (developed and tested on Windows 11)                      |
+| Python     | 3.11 or newer (developed and tested on 3.12.2)                       |
+| Account    | A Google Gemini API key — free tier is enough for a demo            |
+| Target app | Already open, maximized or restored, **not** minimized         |
+| Display    | One screen, 100%–200% scaling; the agent handles DPI virtualization |
 
-## Setup
+There is no database, no server, no login and no cloud component other than the
+Gemini API call itself.
+
+---
+
+## Install
+
+All commands run from the project folder (the folder containing `main.py`).
+
+### 1. Open a terminal in the project folder
+
+PowerShell:
 
 ```powershell
-# from the workspace root
-.\.venv\Scripts\python.exe -m pip install -r desktop_vision_agent\requirements.txt
+cd path\to\exel_automaiton\desktop_vision_agent
+```
 
-cd desktop_vision_agent
+Command Prompt / Git Bash: same idea — `cd` to the folder with `main.py` in it.
+
+### 2. Create a virtual environment
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+Git Bash equivalent:
+
+```bash
+python -m venv .venv
+source .venv/Scripts/activate
+```
+
+If PowerShell blocks the activate script, either run
+`Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` for this window
+only, or skip activation and call the interpreter directly:
+`.\.venv\Scripts\python.exe main.py --check`.
+
+### 3. Install the dependencies
+
+```powershell
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+That installs `pydantic`, `python-dotenv`, `pandas`, `openpyxl`,
+`google-genai`, `pillow`, `pywin32`, `comtypes`, `pywinauto`, `pyperclip` and
+`pyautogui`. The Windows automation packages (`pywin32`, `comtypes`,
+`pywinauto`, `pyautogui`) only install properly on Windows.
+
+For running the tests as well:
+
+```powershell
+python -m pip install pytest pytest-cov
+```
+
+### 4. Create your `.env`
+
+```powershell
 Copy-Item .env.example .env
-# edit .env and set GEMINI_API_KEY
+notepad .env
 ```
 
-## Environment check
+Set the key, nothing else is required:
+
+```dotenv
+GEMINI_API_KEY=your-key-here
+```
+
+Get a key from [https://aistudio.google.com/apikey](https://aistudio.google.com/apikey). Optional variables:
+`GEMINI_MODEL` (default `gemini-3.6-flash`), `LOG_LEVEL`, `LOG_CONSOLE=1` to also
+echo the log to the terminal.
+
+`.env` is gitignored. The agent never prints the key, and every logged prompt or
+response is credential-redacted.
+
+---
+
+## Verify the install
 
 ```powershell
-cd desktop_vision_agent
-..\.venv\Scripts\python.exe main.py --check
+python main.py --check
 ```
 
-The check verifies Python, dependencies, `.env`, the config file, the Gemini
-model name, writable data folders, and the git repository. It never prints the
-API key.
-
-## Commands
-
-| Command | Status |
-|---|---|
-| `python main.py --agent` | Interactive AI Assistant Wizard |
-| `python main.py --agent-ui` | The same wizard in a floating chat window |
-| `python main.py --check` | Implemented (Segment 0) |
-| `python main.py --version` | Implemented (Segment 0) |
-| `python main.py excel inspect` | Implemented (Segment 1) |
-| `python main.py inspect` | Implemented (Segment 2) |
-| `python main.py safety test` | Implemented (Segment 3) |
-| `python main.py ground` | Implemented (Segment 4) |
-| `python main.py setup` | Implemented (Segment 5) |
-| `python main.py calibrate` | Implemented (Segment 6) |
-| `python main.py run` | Implemented (Segment 7) |
-| `python main.py form run` | Implemented (static step plan, no mapping) |
-| `python main.py resume` | Implemented (Segment 8) |
-
-## Interactive Agent Wizard (`--agent`)
-
-The easiest way to run the agent on your own custom application and Excel file:
-
-```powershell
-..\.venv\Scripts\python.exe main.py --agent
-```
-
-The interactive wizard:
-1. Lists open windows and lets you pick or search for your application.
-2. Asks for your Excel file path, verifies sheets, and detects column headers.
-3. Asks **single step** (AI mapping + calibration) or **multi step** (you
-   describe each step in your own words).
-4. Single step: generates a tailored configuration, grounds the layout with
-   Gemini, gets your approval, then calibrates on the first row.
-5. Multi step: resolves each step you describe, shows you what it understood,
-   does it live on the first row, then saves that row when you start automation.
-6. Prompts *"Do you want to start automation?"* and begins batch processing on your go.
-
-## Floating Chat Window (`--agent-ui`)
-
-The terminal wizard needs the terminal in front of you - and it covers the app
-the agent has to look at. This runs the exact same wizard in a small window
-that floats over the corner of your screen:
-
-```powershell
-..\.venv\Scripts\python.exe main.py --agent-ui
-```
-
-- Drag it by the title bar; `▾` collapses it to a strip, `◑` cycles opacity,
-  `✕` closes it.
-- It never takes over your app's window: answers go in the text box at the
-  bottom (Enter or **Send**), and a blank answer means "accept the default".
-- Every line the terminal wizard would print appears in the window, and the
-  terminal keeps its own copy of the log.
-- While automation is running, `✕` waits for it to finish; stop it with `Alt+T`.
-- Chat mode never pauses before each Save, because confirming in the window
-  would move focus off your app right before the click. Use
-  `python main.py form run --confirm-each` in a terminal when you want to
-  approve each save by hand.
-
-If `tkinter` is unavailable, `--agent-ui` falls back to the terminal wizard.
-
-## Safety
-
-- `Alt+T` emergency stop, `Alt+P` pause, `Alt+R` resume.
-- External input is blocked only while the agent is actively running.
-- `Ctrl+Alt+Del` is never blocked.
-- The original workbook is never modified.
-
-Test the lock without running the agent:
-
-```powershell
-..\.venv\Scripts\python.exe main.py safety test --seconds 10
-```
-
-Input is blocked for 10 seconds, or until `Alt+T` is pressed.
-
-## Grounding
-
-`ground` sends one screenshot, the UIA control list, and the Excel headers to
-Gemini, then validates the returned field map:
-
-```powershell
-..\.venv\Scripts\python.exe main.py ground --config config/agent.test.json
-```
-
-It writes `data/grounding/grounding_<stamp>.json` and an annotated screenshot
-(red = fields, blue = buttons). Every API call is logged to `data/ai_logs`
-with credentials redacted. The model is called once per grounding run, not per
-field or per row.
-
-## Mapping approval
-
-`setup` grounds the window, validates the proposed column -> field mapping, and
-asks you to approve it once:
-
-```powershell
-..\.venv\Scripts\python.exe main.py setup --config config/agent.test.json
-```
-
-The interactive editor accepts:
+It prints one line per requirement and ends with `Result: PASSED`:
 
 ```text
-set <column> <field_id>   assign a column to a grounded field
-remove <column>           remove a mapping
-show                      print the current mapping
-done                      finish editing
-cancel                    abort setup
+[ OK ] Platform: Windows 11 (AMD64)
+[ OK ] Python: 3.12.2 (requires >= 3.11)
+[ OK ] dependency: pydantic: configuration models - 2.14.3
+...
+[ OK ] .env file: C:\...\desktop_vision_agent\.env
+[ OK ] GEMINI_API_KEY: loaded (AIza...abcd)
+[ OK ] config: config/agent.example.json - 3 field mapping(s)
+[ OK ] data/output writable: C:\...\data\output
+Result: PASSED - environment is ready
 ```
 
-Approval is refused while there are validation errors (unknown or duplicate
-columns/fields, type mismatches, non-numeric values in a number column, missing
-required columns). Low-confidence entries are warnings and need an explicit
-`approve`. `--yes` approves non-interactively and accepts warnings.
-
-The approved mapping is saved to `data/state/mapping.json` (override with
-`--mapping`). Later segments reuse that file instead of asking Gemini again.
-
-## First-row calibration
-
-`calibrate` processes the first pending row and proves the mapping before
-trusting it:
+A missing API key, a missing dependency, an unwritable `data/` folder or a bad
+config file each show up as `[FAIL]` with the fix spelled out. `--check` never
+calls Gemini and costs nothing.
 
 ```powershell
-..\.venv\Scripts\python.exe main.py calibrate --config config/agent.test.json
+python main.py --version
 ```
 
-It re-inspects the live window, fills the mapped fields, reads them back
-through UIA, takes a pre-save screenshot, and asks Gemini to confirm the
-values. Only then does it click Save. After Save it reads the configured
-success/error text region and marks the row `DONE` only on explicit
-`CONFIRMED` evidence. Every attempt saves its screenshots to
-`data/screenshots/`.
+---
 
-The mapping stays `trusted: false` until both checks pass. On failure the row
-is marked `RECHECK` and the map stays untrusted. A save that may already have
-succeeded is never retried automatically, so a failed calibration cannot
-create duplicate records. `--no-overlay` disables the status overlay.
+## Your first run (10 minutes, safe)
 
-## Save confirmation
+Before pointing the agent at a real business app, drive it against the bundled
+test form. This exercises the whole pipeline against a window designed for it.
 
-`confirmation` in the config decides what counts as a successful Save:
-
-```json
-"confirmation": {
-  "success_region": { "x1": 0, "y1": 850, "x2": 1000, "y2": 950 },
-  "error_region": { "x1": 0, "y1": 850, "x2": 1000, "y2": 950 },
-  "success_pattern": "(?i)saved",
-  "error_patterns": ["(?i)required", "(?i)duplicate", "(?i)error"]
-}
-```
-
-Regions use 0-1000 normalized window coordinates. The agent crops the region
-from the post-Save screenshot and reads its text through the injectable
-`text_reader`; the only real reader in this segment is Gemini-backed. An OCR
-reader can be added later without changing the strategy.
-
-The outcome is explicit:
-
-- `CONFIRMED` - the success pattern matched: the row becomes `DONE`.
-- `REJECTED` - an error pattern matched: the row becomes `RECHECK` and is not
-  saved again.
-- `UNKNOWN` - no usable evidence: the row becomes `RECHECK` with
-  `record may already exist`, never `DONE`.
-
-Pixel comparison of the pre- and post-Save screenshots is only a **weak hint**
-in the log. It can never confirm a save. If no confirmation pattern is
-configured, every saved row is `UNKNOWN`, which fails closed to `RECHECK`.
-
-`run --confirm-each` pauses for Enter or `Y` before each Save click, so you can
-watch the first runs. Anything else stops the run before the click; the row is
-left unsaved.
-
-## Batch run
-
-`run` processes every pending row with the trusted map:
+### Step 1 — a sample workbook
 
 ```powershell
-..\.venv\Scripts\python.exe main.py run --config config/agent.test.json
-..\.venv\Scripts\python.exe main.py run --config config/agent.test.json --limit 5
-..\.venv\Scripts\python.exe main.py run --config config/agent.test.json --confirm-each
+python scripts/make_sample_excel.py
 ```
 
-`run` refuses to start while the mapping is untrusted, so calibration must pass
-first. There is no override flag.
+Writes `data/input/invoices.xlsx` with a header row, five sample rows (one is
+already marked `DONE`, so four are pending) and the status columns the agent
+needs (`Agent Status`, `Agent Timestamp`, `Agent Error`). Regenerate it any
+time; it is safe to overwrite.
 
-Each row is filled with the same deterministic path as calibration. Save is
-judged only by the configured confirmation text, never by pixels and never by
-a guess. A Save clicked once is never clicked again for that row in the same
-run. Retries only cover failures before the click (fill, UIA read-back, or a
-stop), so an uncertain Save cannot create a duplicate record.
+### Step 2 — open the test form
 
-By default `safety.stop_on_failure` is `true`: a non-`DONE` row stops the run
-before the next row. Set it to `false` only when you deliberately want to
-continue past `RECHECK` rows.
-
-Rows are written and the workbook is saved after each row, so stopping mid-run
-loses nothing. Restarting `run` skips every `DONE` and `RECHECK` row by default
-(`excel.skip_statuses`).
-
-The working copy is selected once and recorded in `data/state/output.json`.
-`calibrate` and `run` reuse that same copy, which is how a calibrated row is
-skipped by the batch runner. Delete that file to start a fresh copy from the
-input workbook. If the recorded copy itself is missing, the agent refuses to
-start rather than silently copying the input again, because that would lose
-every status and risk duplicate records. `--no-overlay` disables the status
-overlay.
-
-## Static form mode (`form run`)
-
-`run` needs a grounded, calibrated mapping, and a mapping can express *which*
-field a column goes into but not the *order* of work. `form run` covers the
-smaller case: a form whose controls you can name in the config, where the only
-thing that matters is the sequence — click "Add" to open the entry fields, type
-three text boxes, click Save.
+In a **second** terminal:
 
 ```powershell
-..\.venv\Scripts\python.exe main.py form run --config config/agent.steps.example.json --limit 5
+python scripts/test_form.py
 ```
 
-To build this config without editing JSON, run `python main.py --agent` and
-choose **2. Multi step**: describe each step in your words and the wizard turns
-it into the plan below (see "Multi-step mode").
+A small Tkinter window titled **“Excel Agent Test Form”** appears with Invoice
+Number, Customer Name, Amount, Notes, Save, Clear and a status label. Leave it
+open and in front when the agent asks for it.
 
-Add a `form` block to the config (see `config/agent.steps.example.json`):
+### Step 3 — prove the safety lock works
+
+```powershell
+python main.py safety test --seconds 10
+```
+
+Your mouse and keyboard are blocked for 10 seconds; press `Alt+T` to release
+them early. This is the same lock the agent uses, so you know the escape hatch
+before automation touches your machine.
+
+### Step 4 — let the wizard drive it
+
+```powershell
+python main.py --agent
+```
+
+Answer the prompts:
+
+1. Pick **Excel Agent Test Form** from the open-window list.
+2. Excel path: type `data/input/invoices.xlsx`.
+3. Choose **1. Single step** for the mapped pipeline.
+4. Review the proposed mapping (Invoice Number → Invoice Number, etc.) and
+   accept it.
+5. Watch the first row get filled and saved, and check the calibration result
+   it prints.
+6. Answer **y** to “Do you want to start automation?”. The sample has only four
+   pending rows, so it finishes quickly.
+
+The terminal shows every action and the outcome of each row. When it finishes,
+open `data/output/` — there is a copy of the workbook with `DONE` written for
+each saved row. Your original in `data/input/` is untouched.
+
+### Step 5 — check what it left behind
+
+```powershell
+python main.py clear-data --all --dry-run
+```
+
+Prints how many files and how many MB each category would remove. When you are
+ready for a clean slate:
+
+```powershell
+python main.py clear-data --all
+```
+
+`--all` deliberately keeps `data/input` (your source workbooks) and
+`data/state/mapping.json` (the expensive-to-recreate mapping).
+
+From here, run the same wizard against your own application and your own
+workbook.
+
+---
+
+## Three ways to use it
+
+### 1. Interactive wizard — recommended
+
+```powershell
+python main.py --agent
+```
+
+The wizard does the whole setup for you and writes a config file:
+
+1. Lists open windows; pick or search your application.
+2. Asks for your Excel file, verifies the sheet, detects the header row.
+3. Asks **single step** or **multi step**.
+4. *Single step*: generates a config, grounds the layout, shows you the mapping
+   for approval, then calibrates on the first row.
+5. *Multi step*: you describe each step in plain words (“click Add New”,
+   “fill up all the form”); the wizard turns each into clicks and fills, shows
+   what it understood, and does it live on the first row.
+6. Prompts *“Do you want to start automation?”* and runs the batch.
+
+The same wizard in a floating window, when the terminal would cover your app:
+
+```powershell
+python main.py --agent-ui
+```
+
+Drag it by the title bar; `▾` collapses it, `◑` cycles opacity, `✕` closes it.
+Answers go in the text box (Enter or **Send**); a blank answer accepts the
+default. It never steals focus from your application, which is why it never
+pauses before each save — confirm-per-save is a terminal feature.
+
+### 2. Static step plan — `form run`
+
+For forms where the order of actions is the *whole* problem: click “Add”, type
+three boxes, click Save. Describe the sequence in the config and there is no
+mapping, no calibration and no run state:
 
 ```json
 "form": {
@@ -275,240 +341,454 @@ Add a `form` block to the config (see `config/agent.steps.example.json`):
 }
 ```
 
-There are only two actions: `click` a button and `fill` a text field. A `fill`
-uses the label from `fields` for its column; add `"field": "Other Label"` to a
-step when the same column has to go into a differently named control. Every
-fill step's column must be declared in `fields`, and `optional: true` on a step
-turns a missing control into a note instead of a failure.
-
-How it behaves:
-
-- Targets are matched by UIA name in the live window, so the labels in the
-  config must match what the application reports.
-- The window is re-read after every click, so controls that the click created
-  are found by the steps that follow it.
-- Every fill is read back before Save. A mismatch is a `RECHECK`, not a retry,
-  unless `form.retry_on_failure` is set.
-- Save is clicked once and judged either by the configured confirmation text
-  (`confirmation.verifier: "text"`) or, for apps that show no message, by the
-  saved values appearing on screen (`"row"`: local, no AI call). A row that
-  cannot be confirmed is `RECHECK`, never re-saved.
-- No mapping, no calibration, no run state: rows marked `DONE` in the workbook
-  are skipped, and that is the only progress record.
-
-Not supported in this mode yet: dropdowns, date pickers, grids, and resume
-after a stop. Use the mapped pipeline for forms that need those.
-
-## Multi-step mode (`--agent`, choice 2)
-
-The plan above has to be written as `click`/`fill` steps. Multi-step mode lets
-you describe the work instead, and proves every step on the first row before
-any batch run:
-
-1. **Add a step.** Type an instruction in your own words ("click Add New",
-   "fill up all the form"). The agent screenshots the window and asks Gemini
-   once to turn that sentence into clicks and fills.
-2. **Approve it.** It shows what it understood - which button, or which column
-   goes into which field - and you answer with Enter (do it now), `r` (look at
-   the screen again), or a correction in your own words ("the amount goes in
-   Total, not Country").
-3. **Watch it run.** Approved steps are performed at once, in order, on the
-   first pending row. Every fill is read back, so a box that did not take the
-   text is reported before the next step.
-4. **Start automation.** The wizard writes `config/agent.interactive.steps.json`,
-   clicks Save for the row you just filled, and records its status. It then asks
-   whether the later saves should be checked at all - `[y]` checks each one,
-   `[n]` fills and saves every row without looking at the screen - and, when
-   checking, whether Gemini should read the screen after every Save or the new
-   row should be found locally with no AI call. Finally it asks how many rows to
-   process. Later rows replay the stored plan without asking anything.
-
-The value that proves a save is decided from the row you just saved: whichever
-column's value appeared on screen after it. If the screen shows nothing new, the
-model is asked once, and the ID column is the last resort. With
-`"verifier": "row"` the check stays local - the window is re-read after the
-click and the row counts as saved when a value from `confirmation.footprint`
-shows up more often than before and no form field still holds it. Text matched
-by `confirmation.error_patterns` still rejects a save. Nothing is sent anywhere.
-
-When the new row lands below the fold the local check scrolls down to look for
-it, one screen at a time, and never scrolls back up - the Add button and the
-form are expected to stay where they are. If the Add button itself scrolls away
-the page scrolls as a whole, which this does not support yet: the run stops on
-the row it was checking instead of clicking a button that is no longer there.
-Tune it with `"scrolling": {"enabled": true, "max_screens": 6,
-"settle_seconds": 0.4, "wheel_notches": 5}`; `"enabled": false` reads the
-screen once, as before.
-
-To skip the check altogether - fill and save every row and mark it `DONE`
-without reading the screen - set `confirmation.verifier` to `"none"`, or answer
-`[n]` to "Check the screen after each Save?" in the wizard. Nothing is read, no
-row is scrolled for, and no `RECHECK` is written; a Save that the app refuses
-will not be noticed. The first row is still checked, because that is how the
-wizard tells the plan works. The run prints a warning when it starts and logs
-`save check is off (verifier=none)`, so a later reconciliation knows the
-workbook was not verified.
-
-A row is retried only when `form.retry_on_failure` is set, and never while the
-failed attempt's form is still open: the runner presses `Esc`, re-reads the
-window, and if the form will not close it writes `RECHECK` instead. Starting
-again on top of an abandoned form would click "add" into it and enter the row
-twice, or mix one row's values with another's.
-
-Only one run can drive the application at a time. A lock file at
-`data/state/run.lock` holds the owner's pid; a second run refuses to start with
-`another run is already active (pid …)` instead of interleaving clicks and
-racing on the workbook. A lock left behind by a killed process is taken over
-automatically (the pid is checked), and the file is removed when the run ends.
-
-Setup screenshots are kept in `data/steps/<timestamp>/`. Partial fills are
-normal: a step fills only the columns it matched, and the last step that fills a
-column wins. A step is never left unresolved - it is done, redone, or fixed by
-your correction. Save is not a step you write; it is the final action.
-Dropdowns, selects, and date pickers are still out of scope.
-
-## Stop and resume
-
-`run` records its progress in `data/state/run_state.json` when it starts and
-after every row:
-
 ```powershell
-..\.venv\Scripts\python.exe main.py run --config config/agent.test.json
+python main.py form run --config config/agent.steps.example.json --limit 5
 ```
 
-Press `Alt+T` mid-run. The row currently being filled is left without a
-status; a row that was already saved carries `DONE` in the workbook. When you
-stop:
+Only `click` and `fill` exist. A `fill` uses the label from `fields`; add
+`"field": "Other Label"` when the control is named differently, and
+`"optional": true` when a missing control should be a note rather than a
+failure. The window is re-read after every click, so controls created by a click
+are visible to the steps after it. Every fill is read back before Save.
 
-- the row under way is recorded as unfinished but has no workbook status, so
-  resuming restarts it from scratch instead of saving it twice,
-- every finished row is recorded and never touched again.
+`form run` clicks Save last. It does not open the entry form for you, so a
+plan for a screen that is not already showing the inputs starts with a `click`
+step for the button that opens it. (`new_record_button` is accepted in the
+config but is not used by the current runtime.)
 
-Immediately before each Save click the agent writes a **write-ahead intent**
-(`{row_number, invoice_id, state: "attempting_save", ts}`) to the run state and
-flushes it to disk. If the process dies around Save, `resume` finds that
-marker, marks the row `RECHECK` with
-`interrupted around Save; verify in target app`, and does not retry it
-automatically. A fresh `run` refuses to touch the working copy while such a
-marker is unresolved; it asks you to `resume` first.
+### 3. Mapped pipeline — the explicit route
 
-If the workbook cannot be written after Save (for example, it is open in
-Excel), the outcome is retried with backoff. If it still fails, the run stops
-with a clear message and the outcome is stored in both `run_state.json` and
-`data/state/pending_status.json`. The next `run` or `resume` replays those
-pending statuses before reading any row; it will not process a row while a
-saved outcome is still unwritten.
-
-Continue later:
+Four commands, each of which you can inspect before going on:
 
 ```powershell
-..\.venv\Scripts\python.exe main.py resume --config config/agent.test.json
+python main.py ground    --config config/agent.test.json   # read the screen
+python main.py setup     --config config/agent.test.json   # approve the mapping
+python main.py calibrate --config config/agent.test.json   # prove row 1
+python main.py run       --config config/agent.test.json --limit 5
 ```
 
-`resume` refuses to start unless the mapping, config, input workbook, and
-working copy all match the recorded run. It reuses the exact working copy
-recorded in the run state (repairing `output.json` if needed), re-screenshots,
-re-inspects UIA, and re-resolves the trusted map before touching the next row.
-If the form layout changed structurally, it stops and asks you to run `setup`
-again; it never re-grounds unattended.
+- `ground` sends one screenshot, the UIA control list and your headers to
+  Gemini, validates the returned map, and writes
+  `data/grounding/grounding_<stamp>.json` plus an annotated screenshot
+  (red = fields, blue = buttons). One API call.
+- `setup` grounds, then opens an approval editor: `set <column> <field>`,
+  `remove <column>`, `show`, `done`, `cancel`. Approval is refused while
+  validation errors exist (unknown/duplicate column or field, type mismatch,
+  non-numeric value in a number column, missing required column).
+  Low confidence is a warning and needs an explicit approval. `--yes` approves
+  non-interactively. Saves `data/state/mapping.json`.
+- `calibrate` processes the first pending row: fills, reads back through UIA,
+  takes a pre-save screenshot, asks Gemini to confirm the values, clicks Save,
+  then reads the configured success/error region. The map only becomes
+  `trusted: true` on `CONFIRMED`.
+- `run` refuses to start while the mapping is untrusted — there is no override
+  flag. Use `--confirm-each` to approve each Save by hand while you watch.
 
-A recorded run that can never be resumed — because the config, mapping, or
-input workbook changed, or because the mapping was re-approved — is moved aside
-as `run_state.stale-<timestamp>.json` and `run` starts a fresh batch on the
-copy that run was using. A run whose working copy is missing blocks instead:
-restore the copy, or delete the run state (and `output.json`) to start over,
-accepting that rows already saved in the form may be processed again.
+---
 
-`data/state/run_state.json` is gitignored along with the other runtime state.
+## Commands
 
-## Offline Demonstration
+Run everything from the project folder. `--config` defaults to
+`config/agent.example.json` and `--env-file` defaults to `.env`.
 
-Run the complete pipeline (grounding, mapping, calibration, batch run, and resume)
-with zero Gemini API token usage using the included mock demonstration:
+| Command                                                  | What it does                                        | API calls    |
+| -------------------------------------------------------- | --------------------------------------------------- | ------------ |
+| `python main.py --check`                               | Environment / dependency / config check             | 0            |
+| `python main.py --version`                             | Print version                                       | 0            |
+| `python main.py --agent`                               | Full interactive wizard                             | as needed    |
+| `python main.py --agent-ui`                            | Same wizard in a floating window                    | as needed    |
+| `python main.py agent`                                 | Same wizard, subcommand form                        | as needed    |
+| `python main.py excel inspect --limit 20`              | Show workbook rows and pending count                | 0            |
+| `python main.py inspect`                               | Screenshot + list UIA controls of the target window | 0            |
+| `python main.py safety test --seconds 10`              | Exercise the input lock and hotkeys                 | 0            |
+| `python main.py ground`                                | Ground the layout with Gemini                       | 1            |
+| `python main.py setup [--yes]`                         | Ground + approve/save the mapping                   | 1            |
+| `python main.py calibrate`                             | Fill, verify and save the first pending row         | 2            |
+| `python main.py run [--limit N] [--confirm-each]`      | Batch the pending rows                              | 0–1 per row |
+| `python main.py resume`                                | Continue an interrupted run                         | 0–1 per row |
+| `python main.py form run [--limit N] [--confirm-each]` | Run a static step plan                              | 0–1 per row |
+| `python main.py clear-data [flags]`                    | Delete runtime data from previous runs              | 0            |
+
+Useful flags across the pipeline: `--mapping <path>` (default
+`data/state/mapping.json`), `--state <path>` (default
+`data/state/run_state.json`), `--no-overlay` (hide the status overlay),
+`--no-annotate` (skip the annotated screenshot on `inspect`/`ground`/`setup`).
+
+### `clear-data`
+
+Prints a count and size per category and asks before deleting anything.
+
+| Flag                          | Removes                                                                                                                                                                                 |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--scrn`, `--screenshots` | images under `screenshots`, `setup`, `grounding`, `steps`, `annotated` (JSON plans stay)                                                                                      |
+| `--ai-logs`                 | `data/ai_logs` prompt/response logs                                                                                                                                                   |
+| `--logs`                    | `data/logs`; an `agent.log` still open is emptied instead of deleted                                                                                                                |
+| `--output`                  | working copies in `data/output` **and** `data/state/output.json`                                                                                                              |
+| `--state`                   | `run_state.json`, `run_state.stale-*`, `pending_status.json`, `output.json`, `run.lock`, `state/backup_*` (keeps `mapping.json` and your `demo_*` / `recipe_*` files) |
+| `--mapping`                 | `data/state/mapping.json` — run `setup` again afterwards                                                                                                                           |
+| `--input`                   | source workbooks in `data/input`                                                                                                                                                      |
+| `--backup`                  | `data/backup` archives                                                                                                                                                                |
+| `--cache`                   | `__pycache__` and `.pytest_cache` folders                                                                                                                                           |
+| `--configs`                 | generated `config/agent.interactive*.json` and `config/agent.run*.json`                                                                                                             |
+| `--all`                     | screenshots, AI logs, logs, output, state, backups — **not** `--input`, **not** `mapping.json`                                                                         |
+
+`--dry-run` only previews, `--yes` / `-y` skips the prompt, and `--force`
+clears state even when `pending_status.json` still has queued statuses or
+`run.lock` shows a live run. Files held open elsewhere are reported as
+`skipped` with a non-zero exit code; `.gitkeep` files always survive.
+
+Clearing `--output` means every row is processed again (the input is never
+modified). Clearing `--state` resets progress and run history.
+
+---
+
+## How your data is stored
+
+Everything the agent produces lives under `data/` and is gitignored. The main
+folders exist in the repo via `.gitkeep` files; `backup/` and `steps/` are
+created on demand. `clear-data` never removes a `.gitkeep`.
+
+| Path                               | What is in it                                        |
+| ---------------------------------- | ---------------------------------------------------- |
+| `data/input/`                    | your source workbooks (never modified)               |
+| `data/output/`                   | working copies, one per input, statuses written here |
+| `data/state/output.json`         | which working copy the current run is using          |
+| `data/state/mapping.json`        | approved column → field map + `trusted` flag      |
+| `data/state/run_state.json`      | run progress, write-ahead save intent                |
+| `data/state/pending_status.json` | statuses that could not be written to Excel yet      |
+| `data/state/run.lock`            | pid of the run currently driving the app             |
+| `data/screenshots/`              | pre- and post-save screenshots, one pair per attempt |
+| `data/grounding/`                | grounding JSON + annotated layout screenshot         |
+| `data/setup/`, `data/steps/`   | wizard step plans, per-timestamp screenshots         |
+| `data/ai_logs/`                  | every prompt and response, credentials redacted      |
+| `data/logs/agent.log`            | the log every command appends to                     |
+| `data/annotated/`                | annotated window captures from `inspect`           |
+
+The working copy is chosen once and remembered in `output.json`. `calibrate`
+and `run` reuse that same copy — that is how a calibrated row is skipped by the
+batch runner. Delete `output.json` to start a fresh copy. If the recorded copy
+is missing, the agent **refuses to start** rather than silently re-copying the
+input, because that would lose every status and risk duplicate records.
+
+The workbook is saved after every row, so stopping mid-run loses nothing.
+
+---
+
+## Configuration
+
+Start from `config/agent.example.json` (blank template), `config/agent.test.json`
+(tuned for the bundled test form), or `config/agent.steps.example.json` (step
+plan). The wizard writes `config/agent.interactive.json` /
+`config/agent.interactive.steps.json` for you.
+
+| Block            | Purpose                                                                                                                                                                                          |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `app`          | `title_contains` (substring of the window title), optional `process_name`, `require_foreground`                                                                                            |
+| `excel`        | input/output paths, sheet, `header_row`, id column, status columns, `done_value` / `recheck_value`, `skip_statuses`, `empty_cell_policy` (`skip` or `clear`), `required_columns` |
+| `fields`       | the column → form-field pairs: `column`, `field`, and `type` (`text` or `number`)                                                                                                             |
+| `actions`      | `save_button`, `wait_after_save_seconds` (`new_record_button` is reserved, currently unused)                                                                                              |
+| `gemini`       | `model`, `max_image_dimension`, `timeout_seconds`, `max_retries`, `max_ai_calls` (default 50), `min_layout_confidence`, `min_mapping_confidence`                                   |
+| `confirmation` | normalized 0–1000 `success_region` / `error_region`, `success_pattern`, `error_patterns`, optional `verifier` and `footprint`                                                       |
+| `safety`       | hotkeys, `block_external_input`, `max_attempts`, `action_delay_seconds`, `stop_on_failure`                                                                                               |
+| `form`         | step plan for `form run`: `steps`, `pause_after_click_seconds`, `retry_on_failure`                                                                                                       |
+| `scrolling`    | `enabled`, `max_screens`, `settle_seconds`, `wheel_notches` — used when the new row lands below the fold                                                                                |
+
+Rules the config loader enforces, so you find out at load time rather than
+mid-run:
+
+- the status, timestamp and error columns must not collide with a mapped column;
+- a column can map to a field only one-to-one (`_mapping_is_one_to_one`);
+- every `fill` step's column must be declared in `fields`;
+- confirmation patterns must be valid regular expressions.
+
+### What counts as a saved row
+
+The `confirmation` block decides. Regions are in 0–1000 normalized window
+coordinates, so they survive window moves and scaling. After Save, the agent
+crops the region and reads its text through an injectable `text_reader`
+(Gemini is the only real reader today).
+
+| Outcome       | Meaning                       | Row status                                |
+| ------------- | ----------------------------- | ----------------------------------------- |
+| `CONFIRMED` | `success_pattern` matched   | `DONE`                                  |
+| `REJECTED`  | an `error_patterns` matched | `RECHECK`                               |
+| `UNKNOWN`   | no usable evidence            | `RECHECK`, *record may already exist* |
+
+Pixel difference between the pre- and post-save screenshots is a **weak hint in
+the log only**; it can never confirm a save. If no confirmation pattern is
+configured, every saved row falls back to `RECHECK`.
+
+For apps that show no message at all, `"confirmation": {"verifier": "row"}`
+re-reads the window after the click and looks for a value from the saved row
+appearing more often than before, scrolling down if needed — purely local, no
+AI call. `"verifier": "text"` uses Gemini on the configured region.
+`"verifier": "none"` skips the check entirely: every row is marked `DONE`
+without looking at the screen, and a save the app refused will not be noticed.
+The run prints a warning and logs `save check is off (verifier=none)`.
+
+---
+
+## Safety, stopping and recovering
+
+### Hotkeys
+
+| Key       | Action                                                    |
+| --------- | --------------------------------------------------------- |
+| `Alt+T` | emergency stop, releases the input lock immediately       |
+| `Alt+P` | pause between actions                                     |
+| `Alt+R` | resume; the target window is re-fronted and re-read first |
+
+External input is blocked only while the agent is actively running, the hooks
+are released by a background watchdog if the process dies or hangs, and
+`Ctrl+Alt+Del` is preserved at the OS level as an unblockable escape.
+
+Every click is checked against the live window immediately before it is sent:
+the point must still be inside the target window and land on the app itself, not
+on whatever came in front. Otherwise nothing is clicked and the row stops with
+*“nothing was clicked: … is not over … any more”*. A stale coordinate can never
+click another window. Pausing and closing the form leads to `RECHECK`, not to a
+click at a remembered point.
+
+### Never a duplicate save
+
+- Save is clicked **once** per row. If a save may have happened, the row is not
+  retried automatically — it becomes `RECHECK` with *“interrupted around Save;
+  verify in target app”*.
+- Retries only cover work **before** the click: fill, UIA read-back, or a stop.
+- Immediately before each Save click the agent writes a write-ahead intent
+  (`{row_number, invoice_id, state: "attempting_save", ts}`) and flushes it to
+  disk. `resume` finds it and refuses to re-save.
+- `run` refuses to touch the working copy while such a marker is unresolved; it
+  asks you to `resume` first.
+
+### `stop_on_failure`
+
+`safety.stop_on_failure` defaults to `true`: the first non-`DONE` row stops the
+run before the next row. Set it to `false` only when you deliberately want to
+continue past `RECHECK` rows.
+
+### Stop and resume
+
+Press `Alt+T` mid-run. Finished rows keep their `DONE`; the row in progress has
+no status, so resuming restarts it from scratch instead of saving it twice.
+
+```powershell
+python main.py resume --config config/agent.test.json
+```
+
+`resume` refuses to start unless the config, mapping, input workbook and working
+copy all match the recorded run. It reuses the exact working copy (repairing
+`output.json` if needed), re-screenshots, re-inspects UIA and re-resolves the
+map. If the layout changed structurally it stops and asks for `setup` again —
+it never re-grounds unattended.
+
+A run that can never be resumed (config, mapping or input changed, or the map
+was re-approved) is moved aside as `run_state.stale-<timestamp>.json` and `run`
+starts a fresh batch on the copy that run was using. A run whose working copy is
+missing blocks instead: restore the copy, or delete the run state and
+`output.json` to start over, accepting that saved rows may be processed again.
+
+### If Excel refuses the write
+
+The outcome is retried with backoff. If it still fails, the run stops with a
+clear message and the outcome is stored in both `run_state.json` and
+`pending_status.json`. The next `run` or `resume` replays the pending statuses
+before reading any row, so a saved outcome is never lost and never re-saved.
+
+### One run at a time
+
+`data/state/run.lock` holds the owner pid; a second run refuses to start with
+*“another run is already active (pid …)”* instead of interleaving clicks and
+racing on the workbook. A lock left by a killed process is taken over
+automatically (the pid is checked) and the file is removed when the run ends.
+
+---
+
+## AI usage and cost
+
+The model is `gemini-3.6-flash`, and `gemini.max_ai_calls` is a hard ceiling
+(default 50) — the agent stops rather than silently overspending.
+
+| Action                                                | Calls                                                  |
+| ----------------------------------------------------- | ------------------------------------------------------ |
+| `ground` / `setup`                                | 1 per layout                                           |
+| `calibrate`                                         | 1 pre-save value check + 1 post-save confirmation read |
+| each batch row with `verifier: "text"`              | 1                                                      |
+| each batch row with `verifier: "row"` or `"none"` | 0                                                      |
+| each wizard sentence turned into steps                | 1                                                      |
+| `form run` with `verifier: "none"`                | 0                                                      |
+
+So a 100-row batch after calibration costs about 100 calls with text
+verification, and 0 with local verification. Every call and response is logged
+to `data/ai_logs/` with credentials redacted if you need to audit one.
+
+Nothing else leaves the machine. There are no webhooks, no telemetry, no
+licence check. The only outbound traffic is `google-genai` talking to Gemini;
+the rest is files, plus a `threading.Condition` between the safety layer and the
+runner.
+
+---
+
+## Testing and the offline demo
+
+Unit tests (no window, no API key needed):
+
+```powershell
+python -m pytest
+python -m pytest -v
+```
+
+515 unit tests are collected, plus 7 integration tests in three modules under
+`tests/integration/` (`test_capture`, `test_uia`, `test_fixture_form`). The
+integration tests drive real windows and the Tkinter fixture; run them with the
+test form available and expect them to be slower and environment-sensitive:
+
+```powershell
+python -m pytest tests/integration -v
+```
+
+To see the whole lifecycle — grounding, mapping, calibration, batch run, resume
+— with **zero** API usage and mocked Gemini responses:
 
 ```powershell
 python scripts/demo_offline.py
 ```
 
-## Testing
+It prepares `data/input/invoices.xlsx`, writes `data/state/mapping.json`, runs
+calibration and the batch, then prints the final workbook status and run
+summary. `--no-clean` preserves the existing state and output files instead of
+starting from a clean slate. This is the best thing to show someone who wants to
+understand the project without handing over an API key.
 
-Run unit and live integration tests:
-
-```powershell
-pytest
-```
-
-To run with verbose output:
-
-```powershell
-pytest -v
-```
+---
 
 ## Troubleshooting
 
-### 1. High-DPI Scaling & Coordinates
-- Windows display scaling (125%, 150%, etc.) can cause coordinate misalignment if the target application is DPI-unaware.
-- The agent detects DPI virtualization black padding and uses PerMonitorV2 awareness.
-- When creating custom fixtures, ensure high-DPI mode is enabled.
+**The wizard says no windows match.**
+`app.title_contains` must be a substring of the visible title bar. Minimized
+windows cannot be captured — restore the window. Use `python main.py inspect` to
+see what the agent can actually see.
 
-### 2. Window Not Found or Minimized
-- If `find_window` fails: verify that `app.title_contains` matches part of the visible window title.
-- Minimized windows cannot be captured or interacted with; restore the target window before running `ground`, `calibrate`, or `run`.
+**Coordinates are off / clicks land in the wrong place.**
+Windows display scaling (125%, 150%) can misalign a target that is DPI-unaware.
+The agent compensates for DPI virtualization padding and runs PerMonitorV2
+aware, but if the app itself reports wrong rectangles, try 100% scaling and re-run
+`inspect`. The same applies to custom fixtures.
 
-### 3. Emergency Input Release
-- If the agent blocks your mouse/keyboard and you need immediate control: press **`Alt+T`**.
-- To temporarily pause execution: press **`Alt+P`** (and **`Alt+R`** to resume).
-  The console prints `paused - press Alt+R to continue` and `resumed - continuing`.
-  A pause takes effect between actions, never in the middle of typing a field;
-  on resume the target window is brought back to the front (restored if it was
-  minimised) and the screen is read again before the next click or fill, so the
-  run does not type into whatever you left open. If you closed the form while it
-  was paused, the row is written `RECHECK` instead of the Save button being
-  clicked at a remembered point on the screen. Both `form run` and `run` use the
-  same guard, so the mapped pipeline also reads the screen again and resolves
-  the fields and Save button before it clicks.
-- Every click is verified against the live window immediately before it is
-  sent: the point must still be inside the target window and land on the app
-  itself (not on another application that has come in front). When it does not,
-  nothing is clicked and the row stops with *"nothing was clicked: … is not over
-  … any more"* — a stale coordinate can never click another window.
-- A field whose first read-back disagrees is read once more after 150 ms before
-  the row is failed, because a browser applies a paste a moment after the
-  keystroke.
-- `Ctrl+Alt+Del` is preserved at the Windows OS level as an unblockable escape.
-- The background watchdog automatically releases input hooks if the process terminates or hangs.
+**A button is not found.**
+UIA names must match the config exactly, including spelling and punctuation.
+Open `data/annotated/` and the grounding JSON to see the names the agent read.
+Press `r` in the wizard to re-read the screen after fixing the app state.
 
-## Implemented vs. Deferred (v0.9.10)
+**A row ended `RECHECK` with “record may already exist”.**
+The save clicked but no confirmation evidence was found — usually a wrong
+`success_region` or `success_pattern`. Look at the post-save screenshot in
+`data/screenshots/`, fix the confirmation block, and check the app by hand for
+that row. The row will not be re-saved.
 
-| Feature | Status | Notes |
-|---|:---:|---|
-| Text & Number inputs | Implemented | Filled via UIA and SendInput with clipboard fallback |
-| Single Window Forms | Implemented | Native Windows applications |
-| Visual Grounding | Implemented | Google Gemini (`gemini-3.6-flash`) |
-| First-Row Calibration | Implemented | Pre-save Gemini check and post-save text confirmation |
-| Deterministic Batch Entry | Implemented | One Gemini text-region read per saved row |
-| Save Confirmation | Implemented | Config-driven success/error text; pixels are only a hint |
-| Atomic Stop & Resume | Implemented | Write-ahead save intent plus `run_state.json` |
-| Pending Status Replay | Implemented | `data/state/pending_status.json` sidecar |
-| Low-Level Safety Lock | Implemented | Windows hooks with emergency `Alt+T` release |
-| Combobox / Dropdowns | Deferred | Planned for v1.1 |
-| Checkboxes / Radios | Deferred | Planned for v1.1 |
-| Multi-tab / Wizards | Deferred | Planned for v1.1 |
-| Automatic App Launch | Deferred | User opens target window manually |
-| OCR text reader | Deferred | `TextReader` interface is ready; Gemini is the only reader |
+**Excel is open and the agent cannot write.**
+Close the workbook in Excel. The agent writes the working copy in
+`data/output/`; if Excel holds it, the status retries with backoff and then
+queues into `pending_status.json`.
 
-## Layout
+**`another run is already active (pid …)`.**
+A run is live, or a killed run left a lock. Confirm the pid is gone, then delete
+`data/state/run.lock` (or let the agent take it over — it checks the pid).
+
+**I blocked my own mouse and keyboard.**
+`Alt+T` releases the lock. `Ctrl+Alt+Del` always works.
+
+**Nothing is happening on screen.**
+The console prints every action, and `data/logs/agent.log` has the same story
+with timings. Watch that file rather than the screen. Set `LOG_CONSOLE=1` to
+mirror the log into the terminal.
+
+**A save happened but the workbook says `RECHECK`.**
+That is the fail-closed path working: the agent could not prove the save, so it
+marked the row for a human. Verify the record in the app, correct the status
+column, and continue.
+
+---
+
+## Implemented vs. not supported yet
+
+| Feature                         |   Status   | Notes                                                      |
+| ------------------------------- | :---------: | ---------------------------------------------------------- |
+| Text and number inputs          | Implemented | UIA + SendInput with clipboard fallback                    |
+| Single-window native forms      | Implemented | The main supported case                                    |
+| Browser forms                   | Implemented | UIA names from Chrome/Edge/Brave                           |
+| Visual grounding                | Implemented | Gemini, one call per layout                                |
+| First-row calibration           | Implemented | Pre-save value check + post-save confirmation              |
+| Deterministic batch entry       | Implemented | 0–1 Gemini read per saved row                             |
+| Config-driven save confirmation | Implemented | Text, local row check, or off                              |
+| Stop and resume                 | Implemented | Write-ahead intent + `run_state.json`                    |
+| Pending status replay           | Implemented | `pending_status.json` sidecar                            |
+| Data cleanup                    | Implemented | `clear-data` with per-category plans                     |
+| Step plans (`click`/`fill`) | Implemented | `form run`, plus the multi-step wizard                   |
+| Dropdowns / comboboxes          |  Deferred  | Planned; use the mapped pipeline and fill by hand for now  |
+| Checkboxes / radios             |  Deferred  | Planned                                                    |
+| Multi-tab / wizard screens      |  Deferred  | Planned                                                    |
+| Automatic app launch            |  Deferred  | You open the target window yourself                        |
+| OCR text reader                 |  Deferred  | `TextReader` interface exists; Gemini is the only reader |
+| Pages that scroll as a whole    |  Deferred  | The local save check scrolls the grid, not the window      |
+
+---
+
+## Project layout
 
 ```text
 desktop_vision_agent/
-├── main.py
-├── config/            # agent.example.json + prompt drafts
-├── excel_agent/       # application package
-├── tests/             # unit and integration test suites
-├── scripts/           # test fixtures (test_form.ps1, test_form.py) and demo_offline.py
-├── data/              # runtime input/output/screenshots/state (gitignored)
-├── docs/segments/     # per-segment notes (segments 00-10)
-└── legacy/            # archived experiments (not imported)
+├── main.py                  # thin entrypoint: setup logging, call the CLI
+├── excel_agent/
+│   ├── cli.py               # every command and flag
+│   ├── config.py            # pydantic config models + validation
+│   ├── agent/               # orchestrator, wizard, calibration, steps, state,
+│   │                        # run lock, cleanup, chat UI, row search/evidence
+│   ├── ai/                  # Gemini client, grounding, mapping, prompts
+│   ├── desktop/             # window capture, UIA, input, hotkeys, overlay
+│   ├── excel/               # workbook read/write, status columns
+│   ├── safety/              # input lock, pause guard, controller
+│   ├── models/              # shared data models (actions, rects, rows)
+│   └── utils/               # small helpers (paths, timing, text)
+├── config/                  # agent.example.json, agent.test.json,
+│                            # agent.steps.example.json, prompts/
+├── data/                    # runtime input/output/state/logs (gitignored)
+├── docs/                    # architecture .mmd diagrams + segments/00-10
+├── scripts/                 # test_form.py, make_sample_excel.py,
+│                            # demo_offline.py
+├── tests/                   # unit/ and integration/
+├── plan.md                  # full architecture and segment roadmap
+├── CHANGELOG.md             # one entry per segment
+└── requirements.txt
 ```
 
-See `plan.md` for the full architecture and the 10-segment roadmap.
+---
+
+## FAQ
+
+**Will it overwrite my spreadsheet?**
+No. It copies your input to `data/output/` once and writes statuses only to that
+copy.
+
+**Can I run it on a machine with no internet?**
+Everything except grounding and text-based save confirmation. Run `calibrate`
+and `setup` once while online, then use `verifier: "row"` (or `"none"`) for
+batch runs to keep them local. `scripts/demo_offline.py` shows the fully mocked
+path.
+
+**Can two people run it at once?**
+Not on the same workbook and window. The run lock stops a second run; separate
+copies of the project can run in parallel.
+
+**What if my app is browser-based and the layout changes?**
+The mapped pipeline stops when the layout changes structurally and asks for
+`setup` again, rather than clicking blind. That is deliberate.
+
+**Where do I look when something went wrong?**
+`data/logs/agent.log` first, then `data/screenshots/` for the visual state, then
+`data/ai_logs/` if the model returned something unexpected.
+
+---
+
+See `plan.md` for the full architecture and the 10-segment roadmap, and
+`CHANGELOG.md` for what changed in each segment.

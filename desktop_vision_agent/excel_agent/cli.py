@@ -2,8 +2,8 @@
 
 Implemented: ``--check``, ``--version``, ``excel inspect`` (Segment 1),
 ``inspect`` (Segment 2), ``safety test`` (Segment 3), ``ground`` (Segment 4),
-``setup`` (Segment 5), ``calibrate`` (Segment 6), ``run`` (Segment 7), and
-``resume`` (Segment 8).
+``setup`` (Segment 5), ``calibrate`` (Segment 6), ``run`` (Segment 7),
+``resume`` (Segment 8), and ``clear-data`` (maintenance).
 """
 
 from __future__ import annotations
@@ -23,6 +23,18 @@ from pathlib import Path
 
 from . import __version__
 from .config import ConfigError, load_config, load_env, project_root, resolve_path
+from .agent.cleanup import (
+    CleanupError,
+    active_run_pid,
+    build_plan,
+    display_path,
+    execute_plan,
+    format_plan,
+    human_size,
+    pending_status_entries,
+    record_summary,
+    resolve_categories,
+)
 from .agent.run_lock import RunLock, RunLockError
 from .logging_setup import mask_secret, setup_logging
 
@@ -1772,6 +1784,94 @@ def run_resume(
     )
 
 
+CLEAR_DATA_FLAGS = (
+    "screenshots",
+    "ai_logs",
+    "logs",
+    "output",
+    "state",
+    "mapping",
+    "input",
+    "backup",
+    "cache",
+    "configs",
+)
+
+
+def run_clear_data(
+    categories: list[str] | None = None,
+    *,
+    dry_run: bool = False,
+    assume_yes: bool = False,
+    force: bool = False,
+    root: Path | None = None,
+) -> int:
+    """Delete runtime data from previous runs after showing it first."""
+    base = Path(root) if root is not None else project_root()
+    try:
+        keys = resolve_categories(categories or [])
+    except CleanupError as exc:
+        print(f"ERROR: {exc}")
+        return 2
+    if not keys:
+        print(
+            "usage: python main.py clear-data [--scrn | --ai-logs | --logs | "
+            "--output | --state | --mapping | --input | --backup | --cache | "
+            "--configs | --all] [--dry-run] [--yes] [--force]"
+        )
+        return 2
+
+    if "state" in keys and not force:
+        pending = pending_status_entries(
+            base / "data" / "state" / "pending_status.json"
+        )
+        if pending:
+            print(
+                f"ERROR: {pending} queued row status(es) in "
+                f"{display_path(base / 'data' / 'state' / 'pending_status.json', base)} "
+                "never reached the workbook; run or resume applies them first. "
+                "Use --force to discard them."
+            )
+            return 1
+        owner = active_run_pid(base / "data" / "state" / "run.lock")
+        if owner is not None:
+            print(
+                f"ERROR: run {owner} is still active; finish it or press "
+                "Alt+T there before clearing its state."
+            )
+            return 1
+
+    plan = build_plan(keys, base)
+    if plan.total_files == 0:
+        print(format_plan(plan))
+        print("Nothing to clear.")
+        return 0
+
+    print(format_plan(plan))
+    if dry_run:
+        print("Dry run: nothing was deleted.")
+        return 0
+    if not assume_yes:
+        answer = input(f"Delete {plan.total_files} file(s)? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Cancelled; nothing was deleted.")
+            return 0
+
+    result = execute_plan(plan, base)
+    print(
+        f"Deleted {len(result.deleted)} file(s), freed "
+        f"{human_size(result.freed_bytes)}."
+    )
+    for path in result.truncated:
+        print(f"Emptied open log file: {display_path(path, base)}")
+    for path, reason in result.skipped:
+        print(f"skipped: {display_path(path, base)} ({reason})")
+    logger.info(record_summary(plan, result))
+    if "mapping" in keys:
+        print("Next: `python main.py setup` creates a fresh mapping.")
+    return 1 if result.skipped else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="excel-agent",
@@ -1989,6 +2089,67 @@ def build_parser() -> argparse.ArgumentParser:
         help="pause for Enter/Y before every Save click",
     )
 
+    clear_parser = subparsers.add_parser(
+        "clear-data",
+        help="delete runtime data left behind by previous runs",
+    )
+    clear_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="screenshots, ai logs, logs, output, state and backups",
+    )
+    clear_parser.add_argument(
+        "--scrn",
+        "--screenshots",
+        dest="screenshots",
+        action="store_true",
+        help="screenshots under data/screenshots, setup, grounding, steps, annotated",
+    )
+    clear_parser.add_argument(
+        "--ai-logs", action="store_true", help="data/ai_logs prompt/response logs"
+    )
+    clear_parser.add_argument(
+        "--logs", action="store_true", help="data/logs (an open agent.log is emptied)"
+    )
+    clear_parser.add_argument(
+        "--output",
+        action="store_true",
+        help="data/output working copies plus data/state/output.json",
+    )
+    clear_parser.add_argument(
+        "--state",
+        action="store_true",
+        help="run_state, pending_status, output pointer, run.lock, state backups",
+    )
+    clear_parser.add_argument(
+        "--mapping", action="store_true", help="data/state/mapping.json"
+    )
+    clear_parser.add_argument(
+        "--input", action="store_true", help="data/input source workbooks"
+    )
+    clear_parser.add_argument(
+        "--backup", action="store_true", help="data/backup archives"
+    )
+    clear_parser.add_argument(
+        "--cache", action="store_true", help="__pycache__ and .pytest_cache folders"
+    )
+    clear_parser.add_argument(
+        "--configs",
+        action="store_true",
+        help="generated config/agent.interactive*.json and config/agent.run*.json",
+    )
+    clear_parser.add_argument(
+        "--dry-run", action="store_true", help="show the plan and delete nothing"
+    )
+    clear_parser.add_argument(
+        "--yes", "-y", action="store_true", help="skip the confirmation prompt"
+    )
+    clear_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="clear state even with queued statuses or a live run lock",
+    )
+
     agent_parser = subparsers.add_parser(
         "agent", help="interactive AI assistant wizard to guide setup, calibration, and automation"
     )
@@ -2103,6 +2264,17 @@ def main(argv: list[str] | None = None) -> int:
             "[--confirm-each] [--no-overlay]"
         )
         return 2
+
+    if args.command == "clear-data":
+        selected = [name for name in CLEAR_DATA_FLAGS if getattr(args, name, False)]
+        if args.all:
+            selected.insert(0, "all")
+        return run_clear_data(
+            selected,
+            dry_run=args.dry_run,
+            assume_yes=args.yes,
+            force=args.force,
+        )
 
     if args.command == "resume":
         return run_resume(
